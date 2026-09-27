@@ -1,0 +1,34 @@
+services:
+  orion-meter-reader:
+    build:
+      context: .
+      args:
+        RTL433_VERSION: "25.12"
+    image: orion-meter-reader:25.12
+    container_name: orion-meter-reader
+    restart: unless-stopped
+    init: true
+    environment:
+      SDR_SERIAL: "${SDR_SERIAL:?Set SDR_SERIAL in .env to the Orion dongle serial}"
+      METER_IDS: "${METER_IDS:-}"
+      FREQUENCY: "${FREQUENCY:-905.2M}"
+      SAMPLE_RATE: "${SAMPLE_RATE:-1600k}"
+      GAIN: "${GAIN:-0}"
+      RTL433_EXTRA_ARGS: "${RTL433_EXTRA_ARGS:--f 906.8M -f 908.4M -f 910.0M -f 911.6M -f 913.2M -f 914.8M -f 916.4M -f 918.0M -f 919.6M -f 921.2M -f 922.8M -f 924.4M -H 5}"
+      MAX_JSONL_BYTES: "${MAX_JSONL_BYTES:-104857600}"
+      JSONL_ROTATE_COUNT: "${JSONL_ROTATE_COUNT:-4}"
+    ports:
+      - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-8083}:8083"
+    volumes:
+      - ./data:/data
+      - /dev/bus/usb:/dev/bus/usb
+    device_cgroup_rules:
+      - "c 189:* rwm"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
