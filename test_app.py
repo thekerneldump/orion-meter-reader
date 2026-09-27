@@ -18,6 +18,12 @@ Config = orion_meter_reader.Config
 ReadingStore = orion_meter_reader.ReadingStore
 Receiver = orion_meter_reader.Receiver
 decorate_event = orion_meter_reader.decorate_event
+APP_VERSION = orion_meter_reader.APP_VERSION
+
+
+class VersionTests(unittest.TestCase):
+    def test_release_version(self):
+        self.assertEqual(APP_VERSION, "0.0.1")
 
 
 class ConversionTests(unittest.TestCase):

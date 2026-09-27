@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+APP_VERSION = "0.0.1"
+
 
 def utc_now() -> str:
     """Return a timezone-aware ISO timestamp."""
@@ -313,6 +315,7 @@ class Receiver:
         """Return receiver health without exposing configuration identifiers."""
         with self.lock:
             return {
+                "version": APP_VERSION,
                 "running": self.running,
                 "started_at": self.started_at,
                 "last_packet_at": self.last_packet_at,
@@ -385,6 +388,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "service": "orion-meter-reader",
+                    "version": APP_VERSION,
                     "endpoints": [
                         "/healthz",
                         "/api/readings",

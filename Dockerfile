@@ -24,6 +24,10 @@ RUN git clone --branch "${RTL433_VERSION}" --depth 1 \
     && cmake --install /src/rtl_433/build --prefix /usr/local
 
 FROM python:${PYTHON_VERSION}-slim-bookworm
+ARG APP_VERSION=0.0.1
+
+LABEL org.opencontainers.image.title="Orion Meter Reader" \
+      org.opencontainers.image.version="${APP_VERSION}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
