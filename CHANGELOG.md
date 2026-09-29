@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add `/readings` to stream all retained JSON Lines history, including rotated
+  archives.
+
 ## 0.0.1 - 2026-09-27
 
 Initial release.

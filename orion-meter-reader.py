@@ -187,6 +187,17 @@ class ReadingStore:
             value = self.latest.get(event_id)
             return None if value is None else dict(value)
 
+    def retained_data_files(self) -> list[Path]:
+        """Return retained JSONL files from oldest to newest."""
+        path = self.config.data_file
+        with self.lock:
+            paths = [
+                path.with_name(f"{path.name}.{index}")
+                for index in range(self.config.rotate_count, 0, -1)
+            ]
+            paths.append(path)
+            return [candidate for candidate in paths if candidate.exists()]
+
     def history(self, event_id: str | None, limit: int) -> list[dict[str, Any]]:
         results: deque[dict[str, Any]] = deque(maxlen=limit)
         with self.lock:
@@ -380,6 +391,24 @@ class RequestHandler(BaseHTTPRequestHandler):
                 while chunk := handle.read(64 * 1024):
                     self.wfile.write(chunk)
 
+    def _all_jsonl(self) -> None:
+        with self.server.store.lock:
+            paths = self.server.store.retained_data_files()
+            if not paths:
+                self._json(404, {"error": "No readings have been recorded yet"})
+                return
+
+            size = sum(candidate.stat().st_size for candidate in paths)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            for candidate in paths:
+                with candidate.open("rb") as handle:
+                    while chunk := handle.read(64 * 1024):
+                        self.wfile.write(chunk)
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -395,6 +424,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "/api/readings/{meter_id}",
                         "/api/history?id={meter_id}&limit=100",
                         "/api/readings.jsonl",
+                        "/readings",
                     ],
                 },
             )
@@ -425,6 +455,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/readings.jsonl":
             self._jsonl()
+            return
+        if path == "/readings":
+            self._all_jsonl()
             return
         self._json(404, {"error": "Not found"})
 

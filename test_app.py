@@ -73,6 +73,24 @@ class StoreTests(unittest.TestCase):
             )
             self.assertEqual(store.get("12345678")["reading"], 110)
 
+    def test_retained_data_files_are_oldest_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            path.with_name("readings.jsonl.2").write_text("oldest\n")
+            path.with_name("readings.jsonl.1").write_text("older\n")
+            path.write_text("current\n")
+            store = ReadingStore(
+                Config(
+                    sdr_serial="ORION",
+                    data_file=path,
+                    rotate_count=2,
+                )
+            )
+            self.assertEqual(
+                [candidate.name for candidate in store.retained_data_files()],
+                ["readings.jsonl.2", "readings.jsonl.1", "readings.jsonl"],
+            )
+
 
 class ReceiverTests(unittest.TestCase):
     def test_serial_selector_and_protocol(self):
