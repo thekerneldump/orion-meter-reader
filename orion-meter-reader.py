@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hmac
 import json
+import math
 import os
 import re
 import shlex
@@ -22,6 +24,10 @@ APP_VERSION = "0.0.1"
 DATA_FILE_NAME_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl(?:\.\d+)?$"
 )
+RADIO_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+SDR_SERIAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MIN_CONTROL_FREQUENCY_MHZ = 902.0
+MAX_CONTROL_FREQUENCY_MHZ = 928.0
 
 
 def utc_now() -> str:
@@ -53,6 +59,8 @@ class Config:
     http_port: int = 8083
     rtl433_bin: str = "rtl_433"
     rtl433_extra_args: tuple[str, ...] = ()
+    radio_control_token: str = ""
+    radio_control_serials: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -67,6 +75,11 @@ class Config:
             item.strip()
             for item in os.getenv("METER_IDS", "").split(",")
             if item.strip()
+        )
+        radio_control_serials = frozenset(
+            item.strip().removeprefix(":")
+            for item in os.getenv("RADIO_CONTROL_SERIALS", "").split(",")
+            if item.strip().removeprefix(":")
         )
         return cls(
             sdr_serial=serial,
@@ -83,7 +96,40 @@ class Config:
             rtl433_extra_args=tuple(
                 shlex.split(os.getenv("RTL433_EXTRA_ARGS", ""))
             ),
+            radio_control_token=os.getenv("RADIO_CONTROL_TOKEN", "").strip(),
+            radio_control_serials=radio_control_serials,
         )
+
+
+def canonical_frequency_mhz(value: Any) -> str:
+    """Validate and normalize an auxiliary capture frequency."""
+    if isinstance(value, bool):
+        raise ValueError("frequency_mhz must be a number")
+    try:
+        frequency = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("frequency_mhz must be a number") from exc
+    if not math.isfinite(frequency):
+        raise ValueError("frequency_mhz must be finite")
+    if not MIN_CONTROL_FREQUENCY_MHZ <= frequency <= MAX_CONTROL_FREQUENCY_MHZ:
+        raise ValueError(
+            f"frequency_mhz must be between {MIN_CONTROL_FREQUENCY_MHZ:g} "
+            f"and {MAX_CONTROL_FREQUENCY_MHZ:g}"
+        )
+    return f"{frequency:.3f}".rstrip("0").rstrip(".")
+
+
+def canonical_gain(value: Any) -> str:
+    """Validate and normalize an rtl_433 gain value."""
+    if isinstance(value, bool):
+        raise ValueError("gain must be a number")
+    try:
+        gain = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("gain must be a number") from exc
+    if not math.isfinite(gain) or not 0 <= gain <= 100:
+        raise ValueError("gain must be between 0 and 100")
+    return f"{gain:.1f}".rstrip("0").rstrip(".")
 
 
 def meter_id(event: dict[str, Any]) -> str | None:
@@ -400,15 +446,205 @@ class Receiver:
         self.thread.join(timeout=6)
 
 
+@dataclass
+class ManagedCapture:
+    """An auxiliary rtl_433 capture process started through the API."""
+
+    name: str
+    serial: str
+    frequency_mhz: str
+    filename: str
+    started_at: str
+    process: subprocess.Popen[Any]
+
+    def status(self) -> dict[str, Any]:
+        exit_code = self.process.poll()
+        return {
+            "name": self.name,
+            "frequency_mhz": float(self.frequency_mhz),
+            "filename": self.filename,
+            "started_at": self.started_at,
+            "running": exit_code is None,
+            "exit_code": exit_code,
+        }
+
+
+class RadioManager:
+    """Safely manage auxiliary SDR capture processes."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.data_directory = config.data_file.parent.resolve()
+        self.lock = threading.RLock()
+        self.captures: dict[str, ManagedCapture] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            self.config.radio_control_token
+            and self.config.radio_control_serials
+        )
+
+    def _validate_name(self, name: str) -> None:
+        if not RADIO_NAME_PATTERN.fullmatch(name):
+            raise ValueError(
+                "radio name must start with a lowercase letter and contain only "
+                "lowercase letters, numbers, underscores, or hyphens"
+            )
+
+    def _validate_serial(self, serial: Any) -> str:
+        if not isinstance(serial, str):
+            raise ValueError("serial must be a string")
+        serial = serial.strip().removeprefix(":")
+        if not SDR_SERIAL_PATTERN.fullmatch(serial):
+            raise ValueError("serial contains unsupported characters")
+        if serial == self.config.sdr_serial:
+            raise ValueError("the production receiver cannot be retuned")
+        if serial not in self.config.radio_control_serials:
+            raise ValueError("serial is not allowed by RADIO_CONTROL_SERIALS")
+        return serial
+
+    def _capture_path(self, filename: Any, frequency_mhz: str) -> Path:
+        if filename is None:
+            filename = f"{frequency_mhz}MHz.jsonl"
+        if not isinstance(filename, str) or not DATA_FILE_NAME_PATTERN.fullmatch(
+            filename
+        ):
+            raise ValueError("filename must be a simple .jsonl filename")
+        candidate = self.data_directory / filename
+        if candidate.is_symlink():
+            raise ValueError("filename cannot refer to a symbolic link")
+        if candidate.exists() and not candidate.is_file():
+            raise ValueError("filename does not refer to a regular file")
+        return candidate
+
+    def _stop_locked(self, name: str) -> bool:
+        capture = self.captures.pop(name, None)
+        if capture is None:
+            return False
+        process = capture.process
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        return True
+
+    def start(
+        self,
+        name: str,
+        *,
+        serial: Any,
+        frequency_mhz: Any,
+        gain: Any = None,
+        filename: Any = None,
+    ) -> dict[str, Any]:
+        """Start or retune a named auxiliary receiver."""
+        self._validate_name(name)
+        safe_serial = self._validate_serial(serial)
+        safe_frequency = canonical_frequency_mhz(frequency_mhz)
+        safe_gain = canonical_gain(
+            self.config.gain if gain is None else gain
+        )
+        path = self._capture_path(filename, safe_frequency)
+        command = [
+            self.config.rtl433_bin,
+            "-d",
+            f":{safe_serial}",
+            "-R",
+            "290",
+            "-f",
+            f"{safe_frequency}M",
+            "-s",
+            self.config.sample_rate,
+            "-g",
+            safe_gain,
+            "-M",
+            "time:iso",
+            "-M",
+            "protocol",
+            "-M",
+            "level",
+            "-F",
+            "json",
+        ]
+
+        with self.lock:
+            for capture_name, capture in self.captures.items():
+                if capture_name != name and capture.serial == safe_serial:
+                    raise ValueError(
+                        f"serial is already managed by radio {capture_name!r}"
+                    )
+            self._stop_locked(name)
+            self.data_directory.mkdir(parents=True, exist_ok=True)
+            try:
+                with path.open("a", encoding="utf-8") as output:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=output,
+                        stderr=None,
+                        text=True,
+                    )
+            except OSError as exc:
+                raise RuntimeError(f"could not start rtl_433: {exc}") from exc
+
+            try:
+                return_code = process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise RuntimeError(
+                    f"rtl_433 exited immediately with status {return_code}; "
+                    "check the container logs"
+                )
+
+            capture = ManagedCapture(
+                name=name,
+                serial=safe_serial,
+                frequency_mhz=safe_frequency,
+                filename=path.name,
+                started_at=utc_now(),
+                process=process,
+            )
+            self.captures[name] = capture
+            return capture.status()
+
+    def stop(self, name: str) -> bool:
+        self._validate_name(name)
+        with self.lock:
+            return self._stop_locked(name)
+
+    def statuses(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return [
+                self.captures[name].status()
+                for name in sorted(self.captures)
+            ]
+
+    def stop_all(self) -> None:
+        with self.lock:
+            for name in list(self.captures):
+                self._stop_locked(name)
+
+
 class AppServer(ThreadingHTTPServer):
     """HTTP server carrying shared application state."""
 
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], store: ReadingStore, receiver: Receiver):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        store: ReadingStore,
+        receiver: Receiver,
+        radio_manager: RadioManager,
+    ):
         super().__init__(address, RequestHandler)
         self.store = store
         self.receiver = receiver
+        self.radio_manager = radio_manager
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -416,14 +652,58 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     server: AppServer
 
-    def _json(self, status: int, payload: Any) -> None:
+    def _json(
+        self,
+        status: int,
+        payload: Any,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _require_radio_control(self) -> bool:
+        manager = self.server.radio_manager
+        if not manager.enabled:
+            self._json(
+                503,
+                {
+                    "error": "Radio control is disabled. Configure "
+                    "RADIO_CONTROL_TOKEN and RADIO_CONTROL_SERIALS."
+                },
+            )
+            return False
+        authorization = self.headers.get("Authorization", "")
+        expected = f"Bearer {manager.config.radio_control_token}"
+        if not hmac.compare_digest(authorization, expected):
+            self._json(
+                401,
+                {"error": "Authentication required"},
+                {"WWW-Authenticate": "Bearer"},
+            )
+            return False
+        return True
+
+    def _request_json(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Content-Length must be an integer") from exc
+        if not 0 < length <= 8192:
+            raise ValueError("JSON request body must be between 1 and 8192 bytes")
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("request body must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
 
     def _jsonl(self) -> None:
         path = self.server.store.config.data_file
@@ -500,6 +780,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "/readings",
                         "/files",
                         "/files/{filename}",
+                        "/api/radios",
+                        "/api/radios/{name}",
                     ],
                 },
             )
@@ -546,7 +828,56 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             self._data_file(data_file)
             return
+        if path == "/api/radios":
+            if not self._require_radio_control():
+                return
+            radios = self.server.radio_manager.statuses()
+            self._json(200, {"count": len(radios), "radios": radios})
+            return
         self._json(404, {"error": "Not found"})
+
+    def do_PUT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = (urlparse(self.path).path.rstrip("/") or "/")
+        if not path.startswith("/api/radios/"):
+            self._json(404, {"error": "Not found"})
+            return
+        if not self._require_radio_control():
+            return
+        name = path.removeprefix("/api/radios/")
+        try:
+            payload = self._request_json()
+            status = self.server.radio_manager.start(
+                name,
+                serial=payload.get("serial"),
+                frequency_mhz=payload.get("frequency_mhz"),
+                gain=payload.get("gain"),
+                filename=payload.get("filename"),
+            )
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._json(500, {"error": str(exc)})
+            return
+        self._json(200, status)
+
+    def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = (urlparse(self.path).path.rstrip("/") or "/")
+        if not path.startswith("/api/radios/"):
+            self._json(404, {"error": "Not found"})
+            return
+        if not self._require_radio_control():
+            return
+        name = path.removeprefix("/api/radios/")
+        try:
+            stopped = self.server.radio_manager.stop(name)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        if not stopped:
+            self._json(404, {"error": "Unknown managed radio"})
+            return
+        self._json(200, {"name": name, "stopped": True})
 
     def log_message(self, format_string: str, *args: Any) -> None:
         print(f"http {format_string % args}", flush=True)
@@ -557,7 +888,13 @@ def main() -> None:
     config = Config.from_env()
     store = ReadingStore(config)
     receiver = Receiver(config, store)
-    server = AppServer((config.http_host, config.http_port), store, receiver)
+    radio_manager = RadioManager(config)
+    server = AppServer(
+        (config.http_host, config.http_port),
+        store,
+        receiver,
+        radio_manager,
+    )
     stopping = threading.Event()
 
     def request_stop(signum: int, _frame: Any) -> None:
@@ -574,6 +911,7 @@ def main() -> None:
             server.handle_request()
     finally:
         server.server_close()
+        radio_manager.stop_all()
         receiver.stop()
 
 

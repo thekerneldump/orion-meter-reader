@@ -4,6 +4,8 @@
 
 - Add `/readings` to stream all retained JSON Lines history, including rotated
   archives.
+- Add an optional authenticated API for starting, retuning, inspecting, and
+  stopping allowlisted auxiliary SDR capture radios.
 
 ## 0.0.1 - 2026-09-27
 

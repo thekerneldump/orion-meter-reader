@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("orion-meter-reader.py")
 SPEC = importlib.util.spec_from_file_location("orion_meter_reader", MODULE_PATH)
@@ -17,8 +18,33 @@ SPEC.loader.exec_module(orion_meter_reader)
 Config = orion_meter_reader.Config
 ReadingStore = orion_meter_reader.ReadingStore
 Receiver = orion_meter_reader.Receiver
+RadioManager = orion_meter_reader.RadioManager
 decorate_event = orion_meter_reader.decorate_event
+canonical_frequency_mhz = orion_meter_reader.canonical_frequency_mhz
 APP_VERSION = orion_meter_reader.APP_VERSION
+
+
+class FakeProcess:
+    def __init__(self):
+        self.exit_code = None
+        self.terminated = False
+
+    def poll(self):
+        return self.exit_code
+
+    def terminate(self):
+        self.terminated = True
+        self.exit_code = 0
+
+    def wait(self, timeout=None):
+        if self.exit_code is None:
+            raise orion_meter_reader.subprocess.TimeoutExpired(
+                "rtl_433", timeout
+            )
+        return self.exit_code
+
+    def kill(self):
+        self.exit_code = -9
 
 
 class VersionTests(unittest.TestCase):
@@ -124,6 +150,98 @@ class ReceiverTests(unittest.TestCase):
             self.assertEqual(command[command.index("-d") + 1], ":ORION")
             self.assertEqual(command[command.index("-R") + 1], "290")
             self.assertEqual(command[command.index("-f") + 1], "905.2M")
+
+
+class RadioManagerTests(unittest.TestCase):
+    def test_frequency_validation(self):
+        self.assertEqual(canonical_frequency_mhz(904.8), "904.8")
+        self.assertEqual(canonical_frequency_mhz("924.000"), "924")
+        with self.assertRaises(ValueError):
+            canonical_frequency_mhz(901.9)
+        with self.assertRaises(ValueError):
+            canonical_frequency_mhz("not-a-frequency")
+
+    def test_starts_retunes_and_stops_allowed_auxiliary_radio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            first_process = FakeProcess()
+            second_process = FakeProcess()
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                side_effect=[first_process, second_process],
+            ) as popen:
+                first = manager.start(
+                    "demo",
+                    serial="AUX1",
+                    frequency_mhz=904.8,
+                )
+                second = manager.start(
+                    "demo",
+                    serial="AUX1",
+                    frequency_mhz=924.0,
+                )
+
+            self.assertEqual(first["filename"], "904.8MHz.jsonl")
+            self.assertEqual(second["filename"], "924MHz.jsonl")
+            self.assertTrue(first_process.terminated)
+            first_command = popen.call_args_list[0].args[0]
+            second_command = popen.call_args_list[1].args[0]
+            self.assertEqual(first_command[first_command.index("-d") + 1], ":AUX1")
+            self.assertEqual(first_command[first_command.index("-f") + 1], "904.8M")
+            self.assertEqual(second_command[second_command.index("-f") + 1], "924M")
+            self.assertTrue(manager.stop("demo"))
+            self.assertTrue(second_process.terminated)
+
+    def test_rejects_production_unlisted_and_unsafe_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            with self.assertRaisesRegex(ValueError, "production"):
+                manager.start("demo", serial="ORION", frequency_mhz=910)
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                manager.start("demo", serial="AUX2", frequency_mhz=910)
+            with self.assertRaisesRegex(ValueError, "filename"):
+                manager.start(
+                    "demo",
+                    serial="AUX1",
+                    frequency_mhz=910,
+                    filename="../capture.jsonl",
+                )
+
+    def test_reports_immediate_rtl433_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            process = FakeProcess()
+            process.exit_code = 2
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=process,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "status 2"):
+                    manager.start(
+                        "demo",
+                        serial="AUX1",
+                        frequency_mhz=910,
+                    )
 
 
 if __name__ == "__main__":

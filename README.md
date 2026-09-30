@@ -15,8 +15,10 @@ normal USB passthrough for this setup.
 - An antenna suitable for the local ORION frequency band
 - Host access to `/dev/bus/usb`
 
-The API has no authentication. Keep it on a trusted network and do not expose its
-port to the public internet.
+The reading and file APIs have no authentication. Keep the service on a trusted
+network and do not expose its port to the public internet. The optional
+state-changing radio-control API is disabled by default and requires a bearer
+token plus an explicit SDR serial allowlist.
 
 ## Assign a unique RTL-SDR serial
 
@@ -169,6 +171,58 @@ Protocol 290 counters are tenths of a gallon. API objects retain the original
 The endpoint snapshot may not occur at civil midnight, so
 `usage_since_snapshot_gallons` should not automatically be treated as calendar-day
 usage.
+
+## Auxiliary radio control API
+
+For frequency-hopping experiments, the service can safely start, retune, inspect,
+and stop auxiliary RTL-SDR capture processes. It does not accept shell commands,
+it only permits frequencies from 902 through 928 MHz, and it refuses to retune
+the production receiver configured by `SDR_SERIAL`.
+
+Create a strong token, then add the token and the permitted auxiliary SDR serials
+to `.env`:
+
+```sh
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+```dotenv
+RADIO_CONTROL_TOKEN=<generated-token>
+RADIO_CONTROL_SERIALS=AUX1
+```
+
+Recreate the service after changing `.env`:
+
+```sh
+docker compose up -d --build --force-recreate orion-meter-reader
+```
+
+In Postman, use an `Authorization` header with type **Bearer Token**. Start a
+named capture with `PUT /api/radios/demo` and a JSON body:
+
+```json
+{
+  "serial": "AUX1",
+  "frequency_mhz": 904.8,
+  "gain": 70
+}
+```
+
+The default output filename is derived from the frequency, such as
+`904.8MHz.jsonl`. An optional `filename` property may specify another simple
+`.jsonl` filename. Sending another `PUT` to the same named radio stops its old
+process, retunes it, and appends to the new frequency's file.
+
+Inspect or stop managed captures:
+
+```text
+GET /api/radios
+DELETE /api/radios/demo
+```
+
+Managed capture files immediately appear in `GET /files`. Auxiliary captures
+stop when the main service container stops and are not automatically restarted
+after a container restart.
 
 ## Troubleshooting
 
