@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -18,6 +19,9 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 APP_VERSION = "0.0.1"
+DATA_FILE_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl(?:\.\d+)?$"
+)
 
 
 def utc_now() -> str:
@@ -197,6 +201,52 @@ class ReadingStore:
             ]
             paths.append(path)
             return [candidate for candidate in paths if candidate.exists()]
+
+    def available_data_files(self) -> list[dict[str, Any]]:
+        """Return safe JSONL files available from the data directory."""
+        directory = self.config.data_file.parent.resolve()
+        files: list[dict[str, Any]] = []
+        with self.lock:
+            try:
+                candidates = list(directory.iterdir())
+            except OSError:
+                return []
+            for candidate in candidates:
+                if not DATA_FILE_NAME_PATTERN.fullmatch(candidate.name):
+                    continue
+                if candidate.is_symlink():
+                    continue
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    if resolved.parent != directory or not resolved.is_file():
+                        continue
+                    size = resolved.stat().st_size
+                except OSError:
+                    continue
+                files.append(
+                    {
+                        "name": candidate.name,
+                        "bytes": size,
+                        "url": f"/files/{candidate.name}",
+                    }
+                )
+        return sorted(files, key=lambda item: item["name"])
+
+    def resolve_data_file(self, name: str) -> Path | None:
+        """Resolve an allowed JSONL filename without permitting traversal."""
+        if not DATA_FILE_NAME_PATTERN.fullmatch(name):
+            return None
+        directory = self.config.data_file.parent.resolve()
+        candidate = directory / name
+        if candidate.is_symlink():
+            return None
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            return None
+        if resolved.parent != directory or not resolved.is_file():
+            return None
+        return resolved
 
     def history(self, event_id: str | None, limit: int) -> list[dict[str, Any]]:
         results: deque[dict[str, Any]] = deque(maxlen=limit)
@@ -409,6 +459,29 @@ class RequestHandler(BaseHTTPRequestHandler):
                     while chunk := handle.read(64 * 1024):
                         self.wfile.write(chunk)
 
+    def _data_file(self, path: Path) -> None:
+        """Stream a fixed snapshot of a JSONL file that may still be growing."""
+        try:
+            handle = path.open("rb")
+        except OSError:
+            self._json(404, {"error": "Data file not found"})
+            return
+
+        with handle:
+            size = os.fstat(handle.fileno()).st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            remaining = size
+            while remaining > 0:
+                chunk = handle.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -425,6 +498,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "/api/history?id={meter_id}&limit=100",
                         "/api/readings.jsonl",
                         "/readings",
+                        "/files",
+                        "/files/{filename}",
                     ],
                 },
             )
@@ -458,6 +533,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/readings":
             self._all_jsonl()
+            return
+        if path == "/files":
+            files = self.server.store.available_data_files()
+            self._json(200, {"count": len(files), "files": files})
+            return
+        if path.startswith("/files/"):
+            filename = path.removeprefix("/files/")
+            data_file = self.server.store.resolve_data_file(filename)
+            if data_file is None:
+                self._json(404, {"error": "Data file not found"})
+                return
+            self._data_file(data_file)
             return
         self._json(404, {"error": "Not found"})
 

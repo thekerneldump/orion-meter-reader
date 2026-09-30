@@ -144,6 +144,8 @@ curl http://<reader-host>:8083/api/readings/<meter-id>
 curl 'http://<reader-host>:8083/api/history?id=<meter-id>&limit=100'
 curl -O http://<reader-host>:8083/api/readings.jsonl
 curl http://<reader-host>:8083/readings
+curl http://<reader-host>:8083/files
+curl -O http://<reader-host>:8083/files/<capture-name>.jsonl
 ```
 
 Files are retained in `data/readings.jsonl` and rotated at 100 MiB by default.
@@ -151,6 +153,11 @@ Files are retained in `data/readings.jsonl` and rotated at 100 MiB by default.
 retained JSON Lines history in chronological order: the oldest rotated archive
 first and the active file last. Raw records contain meter identifiers, so keep
 these endpoints on a trusted network.
+
+`/files` lists every safe JSONL capture in the mounted `data` directory, including
+standalone frequency-test files. Download one with `/files/<filename>`. Only
+simple JSONL filenames are exposed; directory traversal, symbolic links, hidden
+files, and other file types are rejected.
 Protocol 290 counters are tenths of a gallon. API objects retain the original
 `rtl_433` fields and add:
 

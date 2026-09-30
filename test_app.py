@@ -91,6 +91,26 @@ class StoreTests(unittest.TestCase):
                 ["readings.jsonl.2", "readings.jsonl.1", "readings.jsonl"],
             )
 
+    def test_exposes_only_safe_jsonl_data_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            path.write_text("current\n")
+            path.with_name("readings.jsonl.1").write_text("older\n")
+            path.with_name("920.9MHz.jsonl").write_text("capture\n")
+            path.with_name("notes.txt").write_text("private\n")
+            store = ReadingStore(Config(sdr_serial="ORION", data_file=path))
+
+            self.assertEqual(
+                [item["name"] for item in store.available_data_files()],
+                ["920.9MHz.jsonl", "readings.jsonl", "readings.jsonl.1"],
+            )
+            self.assertEqual(
+                store.resolve_data_file("920.9MHz.jsonl"),
+                path.with_name("920.9MHz.jsonl").resolve(),
+            )
+            self.assertIsNone(store.resolve_data_file("../secret.jsonl"))
+            self.assertIsNone(store.resolve_data_file("notes.txt"))
+
 
 class ReceiverTests(unittest.TestCase):
     def test_serial_selector_and_protocol(self):
