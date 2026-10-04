@@ -52,6 +52,17 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(APP_VERSION, "0.0.1")
 
 
+class ConfigTests(unittest.TestCase):
+    def test_none_disables_extra_rtl433_arguments(self):
+        with mock.patch.dict(
+            orion_meter_reader.os.environ,
+            {"SDR_SERIAL": "ORION", "RTL433_EXTRA_ARGS": "none"},
+            clear=True,
+        ):
+            config = Config.from_env()
+        self.assertEqual(config.rtl433_extra_args, ())
+
+
 class ConversionTests(unittest.TestCase):
     def test_protocol_290_counter_conversion(self):
         event = decorate_event(
@@ -151,6 +162,74 @@ class ReceiverTests(unittest.TestCase):
             self.assertEqual(command[command.index("-R") + 1], "290")
             self.assertEqual(command[command.index("-f") + 1], "905.2M")
 
+    def test_recenters_after_consistent_matching_packets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                frequency="921.2M",
+                meter_ids=frozenset({"12345678"}),
+                data_file=Path(directory) / "readings.jsonl",
+                auto_recenter_enabled=True,
+                auto_recenter_threshold_mhz=0.35,
+                auto_recenter_min_packets=5,
+                auto_recenter_window_seconds=300,
+                auto_recenter_cooldown_seconds=900,
+            )
+            receiver = Receiver(config, ReadingStore(config))
+            adjustment = None
+            for index in range(5):
+                adjustment = receiver.observe_frequency(
+                    {
+                        "id": 12345678,
+                        "freq1": 921.48 + index * 0.001,
+                        "freq2": 921.68 + index * 0.001,
+                    },
+                    now=float(index),
+                )
+
+            self.assertIsNotNone(adjustment)
+            self.assertEqual(adjustment["old_frequency_mhz"], 921.2)
+            self.assertEqual(adjustment["new_frequency_mhz"], 921.6)
+            self.assertNotIn("id", adjustment)
+            command = receiver.command()
+            self.assertEqual(command[command.index("-f") + 1], "921.6M")
+
+    def test_recenter_ignores_unconfigured_meter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                frequency="921.2M",
+                meter_ids=frozenset({"12345678"}),
+                data_file=Path(directory) / "readings.jsonl",
+                auto_recenter_enabled=True,
+                auto_recenter_min_packets=3,
+            )
+            receiver = Receiver(config, ReadingStore(config))
+            for index in range(5):
+                adjustment = receiver.observe_frequency(
+                    {
+                        "id": 87654321,
+                        "freq1": 922.0,
+                        "freq2": 922.2,
+                    },
+                    now=float(index),
+                )
+                self.assertIsNone(adjustment)
+            self.assertEqual(receiver.current_frequency_mhz, 921.2)
+
+    def test_recenter_is_disabled_for_frequency_hopping_receiver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                meter_ids=frozenset({"12345678"}),
+                data_file=Path(directory) / "readings.jsonl",
+                rtl433_extra_args=("-f", "921.2M", "-H", "5"),
+                auto_recenter_enabled=True,
+            )
+            receiver = Receiver(config, ReadingStore(config))
+            self.assertFalse(receiver.auto_recenter_active)
+            self.assertIn("frequency hopping", receiver.auto_recenter_disabled_reason)
+
 
 class RadioManagerTests(unittest.TestCase):
     def test_frequency_validation(self):
@@ -242,6 +321,67 @@ class RadioManagerTests(unittest.TestCase):
                         serial="AUX1",
                         frequency_mhz=910,
                     )
+
+    def test_starts_multi_frequency_sweep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            process = FakeProcess()
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen:
+                status = manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequencies_mhz=[905.2, 910.0, 921.2],
+                    hop_seconds=120,
+                    filename="discovery.jsonl",
+                )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "-f"
+                ],
+                ["905.2M", "910M", "921.2M"],
+            )
+            self.assertEqual(command[command.index("-H") + 1], "120")
+            self.assertIsNone(status["frequency_mhz"])
+            self.assertEqual(status["frequencies_mhz"], [905.2, 910.0, 921.2])
+            self.assertEqual(status["hop_seconds"], 120)
+
+    def test_rejects_invalid_sweep_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            with self.assertRaisesRegex(ValueError, "2 through 32"):
+                manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequencies_mhz=[905.2],
+                    hop_seconds=120,
+                )
+            with self.assertRaisesRegex(ValueError, "between 5 and 3600"):
+                manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequencies_mhz=[905.2, 910.0],
+                    hop_seconds=1,
+                )
 
 
 if __name__ == "__main__":

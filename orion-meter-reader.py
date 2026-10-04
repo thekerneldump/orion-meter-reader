@@ -10,8 +10,10 @@ import os
 import re
 import shlex
 import signal
+import statistics
 import subprocess
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,6 +45,23 @@ def env_int(name: str, default: int) -> int:
         raise SystemExit(f"{name} must be an integer, got {value!r}") from exc
 
 
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name, str(default))
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number, got {value!r}") from exc
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "true" if default else "false").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{name} must be true or false, got {value!r}")
+
+
 @dataclass(frozen=True)
 class Config:
     """Application configuration."""
@@ -61,6 +80,11 @@ class Config:
     rtl433_extra_args: tuple[str, ...] = ()
     radio_control_token: str = ""
     radio_control_serials: frozenset[str] = frozenset()
+    auto_recenter_enabled: bool = False
+    auto_recenter_threshold_mhz: float = 0.35
+    auto_recenter_min_packets: int = 5
+    auto_recenter_window_seconds: int = 300
+    auto_recenter_cooldown_seconds: int = 900
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -93,11 +117,27 @@ class Config:
             http_host=os.getenv("HTTP_HOST", "0.0.0.0"),
             http_port=env_int("HTTP_PORT", 8083),
             rtl433_bin=os.getenv("RTL433_BIN", "rtl_433"),
-            rtl433_extra_args=tuple(
-                shlex.split(os.getenv("RTL433_EXTRA_ARGS", ""))
+            rtl433_extra_args=(
+                ()
+                if os.getenv("RTL433_EXTRA_ARGS", "").strip().lower()
+                in {"none", "off"}
+                else tuple(shlex.split(os.getenv("RTL433_EXTRA_ARGS", "")))
             ),
             radio_control_token=os.getenv("RADIO_CONTROL_TOKEN", "").strip(),
             radio_control_serials=radio_control_serials,
+            auto_recenter_enabled=env_bool("AUTO_RECENTER_ENABLED"),
+            auto_recenter_threshold_mhz=env_float(
+                "AUTO_RECENTER_THRESHOLD_MHZ", 0.35
+            ),
+            auto_recenter_min_packets=env_int(
+                "AUTO_RECENTER_MIN_PACKETS", 5
+            ),
+            auto_recenter_window_seconds=env_int(
+                "AUTO_RECENTER_WINDOW_SECONDS", 300
+            ),
+            auto_recenter_cooldown_seconds=env_int(
+                "AUTO_RECENTER_COOLDOWN_SECONDS", 900
+            ),
         )
 
 
@@ -130,6 +170,16 @@ def canonical_gain(value: Any) -> str:
     if not math.isfinite(gain) or not 0 <= gain <= 100:
         raise ValueError("gain must be between 0 and 100")
     return f"{gain:.1f}".rstrip("0").rstrip(".")
+
+
+def configured_frequency_mhz(value: str) -> float:
+    """Parse an rtl_433 frequency such as 921.2M into MHz."""
+    normalized = value.strip().lower()
+    if normalized.endswith("mhz"):
+        normalized = normalized[:-3]
+    elif normalized.endswith("m"):
+        normalized = normalized[:-1]
+    return float(canonical_frequency_mhz(normalized))
 
 
 def meter_id(event: dict[str, Any]) -> str | None:
@@ -327,9 +377,48 @@ class Receiver:
         self.restart_count = 0
         self.decode_errors = 0
         self.write_errors = 0
+        self.current_frequency_mhz = configured_frequency_mhz(config.frequency)
+        self.frequency_observations: deque[tuple[float, float]] = deque()
+        self.last_recenter_monotonic: float | None = None
+        self.last_recenter_at: str | None = None
+        self.auto_recenter_disabled_reason: str | None = None
+        if config.auto_recenter_enabled:
+            if len(config.meter_ids) != 1:
+                self.auto_recenter_disabled_reason = (
+                    "AUTO_RECENTER_ENABLED requires exactly one METER_IDS value"
+                )
+            elif "-f" in config.rtl433_extra_args or "-H" in config.rtl433_extra_args:
+                self.auto_recenter_disabled_reason = (
+                    "automatic recentering cannot be combined with rtl_433 frequency hopping"
+                )
+            elif config.auto_recenter_threshold_mhz <= 0:
+                self.auto_recenter_disabled_reason = (
+                    "AUTO_RECENTER_THRESHOLD_MHZ must be greater than zero"
+                )
+            elif config.auto_recenter_min_packets < 3:
+                self.auto_recenter_disabled_reason = (
+                    "AUTO_RECENTER_MIN_PACKETS must be at least 3"
+                )
+            elif config.auto_recenter_window_seconds <= 0:
+                self.auto_recenter_disabled_reason = (
+                    "AUTO_RECENTER_WINDOW_SECONDS must be greater than zero"
+                )
+            elif config.auto_recenter_cooldown_seconds < 0:
+                self.auto_recenter_disabled_reason = (
+                    "AUTO_RECENTER_COOLDOWN_SECONDS cannot be negative"
+                )
+
+    @property
+    def auto_recenter_active(self) -> bool:
+        return (
+            self.config.auto_recenter_enabled
+            and self.auto_recenter_disabled_reason is None
+        )
 
     def command(self) -> list[str]:
         """Build the rtl_433 command line."""
+        with self.lock:
+            frequency = self.current_frequency_mhz
         return [
             self.config.rtl433_bin,
             "-d",
@@ -337,7 +426,7 @@ class Receiver:
             "-R",
             "290",
             "-f",
-            self.config.frequency,
+            f"{canonical_frequency_mhz(frequency)}M",
             "-s",
             self.config.sample_rate,
             "-g",
@@ -353,12 +442,93 @@ class Receiver:
             "json",
         ]
 
+    def observe_frequency(
+        self,
+        event: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a safe recenter action after consistent matching packets."""
+        if not self.auto_recenter_active:
+            return None
+        if meter_id(event) not in self.config.meter_ids:
+            return None
+
+        freq1 = event.get("freq1")
+        freq2 = event.get("freq2")
+        if (
+            not isinstance(freq1, (int, float))
+            or isinstance(freq1, bool)
+            or not isinstance(freq2, (int, float))
+            or isinstance(freq2, bool)
+        ):
+            return None
+        midpoint = (float(freq1) + float(freq2)) / 2
+        if not MIN_CONTROL_FREQUENCY_MHZ <= midpoint <= MAX_CONTROL_FREQUENCY_MHZ:
+            return None
+
+        observed_at = time.monotonic() if now is None else now
+        with self.lock:
+            self.frequency_observations.append((observed_at, midpoint))
+            cutoff = observed_at - self.config.auto_recenter_window_seconds
+            while (
+                self.frequency_observations
+                and self.frequency_observations[0][0] < cutoff
+            ):
+                self.frequency_observations.popleft()
+
+            if len(self.frequency_observations) < self.config.auto_recenter_min_packets:
+                return None
+            if (
+                self.last_recenter_monotonic is not None
+                and observed_at - self.last_recenter_monotonic
+                < self.config.auto_recenter_cooldown_seconds
+            ):
+                return None
+
+            observed_midpoint = statistics.median(
+                value for _, value in self.frequency_observations
+            )
+            old_frequency = self.current_frequency_mhz
+            if (
+                abs(observed_midpoint - old_frequency)
+                < self.config.auto_recenter_threshold_mhz
+            ):
+                return None
+
+            new_frequency = round(observed_midpoint, 1)
+            if not MIN_CONTROL_FREQUENCY_MHZ <= new_frequency <= MAX_CONTROL_FREQUENCY_MHZ:
+                return None
+            self.current_frequency_mhz = new_frequency
+            self.last_recenter_monotonic = observed_at
+            self.last_recenter_at = utc_now()
+            packet_count = len(self.frequency_observations)
+            self.frequency_observations.clear()
+            return {
+                "action": "recenter",
+                "receiver": "production",
+                "old_frequency_mhz": old_frequency,
+                "new_frequency_mhz": new_frequency,
+                "observed_midpoint_mhz": round(observed_midpoint, 3),
+                "packet_count": packet_count,
+                "reason": "rolling packet midpoint exceeded configured threshold",
+            }
+
     def start(self) -> None:
+        if self.auto_recenter_disabled_reason:
+            print(
+                f"Automatic recentering disabled: {self.auto_recenter_disabled_reason}",
+                flush=True,
+            )
         self.thread.start()
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
-            print("Starting rtl_433 receiver", flush=True)
+            print(
+                "Starting rtl_433 receiver "
+                f"at {canonical_frequency_mhz(self.current_frequency_mhz)} MHz",
+                flush=True,
+            )
             try:
                 process = subprocess.Popen(
                     self.command(),
@@ -381,6 +551,7 @@ class Receiver:
                 self.started_at = utc_now()
                 self.last_error = None
 
+            planned_recenter: dict[str, Any] | None = None
             assert process.stdout is not None
             for line in process.stdout:
                 if self.stop_event.is_set():
@@ -406,14 +577,27 @@ class Receiver:
                 if event is not None:
                     with self.lock:
                         self.last_packet_at = utc_now()
+                    planned_recenter = self.observe_frequency(raw_event)
+                    if planned_recenter is not None:
+                        print(
+                            "radio_adjustment "
+                            + json.dumps(planned_recenter, sort_keys=True),
+                            flush=True,
+                        )
+                        process.terminate()
+                        break
 
             return_code = process.wait()
             with self.lock:
                 self.process = None
                 self.running = False
-                if not self.stop_event.is_set():
+                if planned_recenter is not None:
+                    self.last_error = None
+                elif not self.stop_event.is_set():
                     self.restart_count += 1
                     self.last_error = f"rtl_433 exited with status {return_code}"
+            if planned_recenter is not None:
+                continue
             if not self.stop_event.is_set():
                 print(f"{self.last_error}; restarting in 5 seconds", flush=True)
                 self.stop_event.wait(5)
@@ -431,6 +615,10 @@ class Receiver:
                 "decode_errors": self.decode_errors,
                 "write_errors": self.write_errors,
                 "events_written_this_run": self.store.events_written,
+                "frequency_mhz": self.current_frequency_mhz,
+                "auto_recenter_enabled": self.auto_recenter_active,
+                "auto_recenter_disabled_reason": self.auto_recenter_disabled_reason,
+                "last_recenter_at": self.last_recenter_at,
             }
 
     def stop(self) -> None:
@@ -452,7 +640,8 @@ class ManagedCapture:
 
     name: str
     serial: str
-    frequency_mhz: str
+    frequencies_mhz: tuple[str, ...]
+    hop_seconds: int | None
     filename: str
     started_at: str
     process: subprocess.Popen[Any]
@@ -461,7 +650,15 @@ class ManagedCapture:
         exit_code = self.process.poll()
         return {
             "name": self.name,
-            "frequency_mhz": float(self.frequency_mhz),
+            "frequency_mhz": (
+                float(self.frequencies_mhz[0])
+                if len(self.frequencies_mhz) == 1
+                else None
+            ),
+            "frequencies_mhz": [
+                float(value) for value in self.frequencies_mhz
+            ],
+            "hop_seconds": self.hop_seconds,
             "filename": self.filename,
             "started_at": self.started_at,
             "running": exit_code is None,
@@ -518,6 +715,50 @@ class RadioManager:
             raise ValueError("filename does not refer to a regular file")
         return candidate
 
+    def _validate_frequencies(
+        self,
+        frequency_mhz: Any,
+        frequencies_mhz: Any,
+    ) -> tuple[str, ...]:
+        if frequencies_mhz is None:
+            return (canonical_frequency_mhz(frequency_mhz),)
+        if frequency_mhz is not None:
+            raise ValueError(
+                "provide frequency_mhz or frequencies_mhz, not both"
+            )
+        if not isinstance(frequencies_mhz, list):
+            raise ValueError("frequencies_mhz must be a JSON array")
+        if not 2 <= len(frequencies_mhz) <= 32:
+            raise ValueError("frequencies_mhz must contain 2 through 32 values")
+        normalized = tuple(
+            canonical_frequency_mhz(value) for value in frequencies_mhz
+        )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("frequencies_mhz cannot contain duplicates")
+        return normalized
+
+    def _validate_hop_seconds(
+        self,
+        value: Any,
+        *,
+        sweeping: bool,
+    ) -> int | None:
+        if not sweeping:
+            if value is not None:
+                raise ValueError(
+                    "hop_seconds is only valid with frequencies_mhz"
+                )
+            return None
+        if isinstance(value, bool):
+            raise ValueError("hop_seconds must be an integer")
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("hop_seconds must be an integer") from exc
+        if not 5 <= seconds <= 3600:
+            raise ValueError("hop_seconds must be between 5 and 3600")
+        return seconds
+
     def _stop_locked(self, name: str) -> bool:
         capture = self.captures.pop(name, None)
         if capture is None:
@@ -537,14 +778,23 @@ class RadioManager:
         name: str,
         *,
         serial: Any,
-        frequency_mhz: Any,
+        frequency_mhz: Any = None,
+        frequencies_mhz: Any = None,
+        hop_seconds: Any = None,
         gain: Any = None,
         filename: Any = None,
     ) -> dict[str, Any]:
         """Start or retune a named auxiliary receiver."""
         self._validate_name(name)
         safe_serial = self._validate_serial(serial)
-        safe_frequency = canonical_frequency_mhz(frequency_mhz)
+        safe_frequencies = self._validate_frequencies(
+            frequency_mhz, frequencies_mhz
+        )
+        safe_frequency = safe_frequencies[0]
+        safe_hop_seconds = self._validate_hop_seconds(
+            hop_seconds,
+            sweeping=len(safe_frequencies) > 1,
+        )
         safe_gain = canonical_gain(
             self.config.gain if gain is None else gain
         )
@@ -555,12 +805,18 @@ class RadioManager:
             f":{safe_serial}",
             "-R",
             "290",
-            "-f",
-            f"{safe_frequency}M",
+        ]
+        for frequency in safe_frequencies:
+            command.extend(("-f", f"{frequency}M"))
+        command.extend([
             "-s",
             self.config.sample_rate,
             "-g",
             safe_gain,
+        ])
+        if safe_hop_seconds is not None:
+            command.extend(("-H", str(safe_hop_seconds)))
+        command.extend([
             "-M",
             "time:iso",
             "-M",
@@ -569,7 +825,7 @@ class RadioManager:
             "level",
             "-F",
             "json",
-        ]
+        ])
 
         with self.lock:
             for capture_name, capture in self.captures.items():
@@ -577,6 +833,12 @@ class RadioManager:
                     raise ValueError(
                         f"serial is already managed by radio {capture_name!r}"
                     )
+            previous = self.captures.get(name)
+            old_frequencies = (
+                [float(value) for value in previous.frequencies_mhz]
+                if previous is not None
+                else None
+            )
             self._stop_locked(name)
             self.data_directory.mkdir(parents=True, exist_ok=True)
             try:
@@ -603,12 +865,30 @@ class RadioManager:
             capture = ManagedCapture(
                 name=name,
                 serial=safe_serial,
-                frequency_mhz=safe_frequency,
+                frequencies_mhz=safe_frequencies,
+                hop_seconds=safe_hop_seconds,
                 filename=path.name,
                 started_at=utc_now(),
                 process=process,
             )
             self.captures[name] = capture
+            print(
+                "radio_adjustment "
+                + json.dumps(
+                    {
+                        "action": "retune" if previous is not None else "start",
+                        "receiver": name,
+                        "old_frequencies_mhz": old_frequencies,
+                        "new_frequencies_mhz": [
+                            float(value) for value in safe_frequencies
+                        ],
+                        "hop_seconds": safe_hop_seconds,
+                        "reason": "authenticated radio-control API",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             return capture.status()
 
     def stop(self, name: str) -> bool:
@@ -850,6 +1130,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 name,
                 serial=payload.get("serial"),
                 frequency_mhz=payload.get("frequency_mhz"),
+                frequencies_mhz=payload.get("frequencies_mhz"),
+                hop_seconds=payload.get("hop_seconds"),
                 gain=payload.get("gain"),
                 filename=payload.get("filename"),
             )

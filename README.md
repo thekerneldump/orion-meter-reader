@@ -102,8 +102,36 @@ RTL433_EXTRA_ARGS=-f 906.8M -f 908.4M -f 910.0M -f 911.6M -f 913.2M -f 914.8M -f
 `FREQUENCY` supplies the first `-f` option; `RTL433_EXTRA_ARGS` supplies the
 remaining center frequencies and the five-second hop interval. If a fixed center
 frequency is more reliable at your location, replace `FREQUENCY` with that value
-and leave `RTL433_EXTRA_ARGS` empty. Gain `0` selects automatic gain; a supported
-fixed gain can be configured with `GAIN`.
+and set `RTL433_EXTRA_ARGS=none`. An empty or unset value retains the default
+frequency list so existing single-radio scanners keep working after an update.
+Gain `0` selects automatic gain; a supported fixed gain can be configured with
+`GAIN`.
+
+### Automatic fixed-center recentering
+
+Automatic recentering can follow slow movement of a fixed receiver's decoded
+channel. It is opt-in, requires exactly one configured `METER_IDS` value, and is
+disabled whenever `RTL433_EXTRA_ARGS` contains rtl_433 frequency-hopping options.
+It does not discover a completely silent channel; use a separate scanning radio
+for discovery.
+
+For a fixed production receiver, configure:
+
+```dotenv
+FREQUENCY=921.2M
+RTL433_EXTRA_ARGS=none
+AUTO_RECENTER_ENABLED=true
+AUTO_RECENTER_THRESHOLD_MHZ=0.35
+AUTO_RECENTER_MIN_PACKETS=5
+AUTO_RECENTER_WINDOW_SECONDS=300
+AUTO_RECENTER_COOLDOWN_SECONDS=900
+```
+
+After the required number of matching packets moves beyond the threshold, the
+service rounds their median channel midpoint to 0.1 MHz, restarts only the
+`rtl_433` child process at that center, and enforces the cooldown. Every automatic
+or API-requested adjustment writes a `radio_adjustment` JSON object to the
+container log. Meter identifiers are not included in adjustment log entries.
 
 ## Build and run
 
@@ -212,6 +240,27 @@ The default output filename is derived from the frequency, such as
 `904.8MHz.jsonl`. An optional `filename` property may specify another simple
 `.jsonl` filename. Sending another `PUT` to the same named radio stops its old
 process, retunes it, and appends to the new frequency's file.
+
+Each start or retune also writes a `radio_adjustment` entry to the container log
+with the previous center, new center, and adjustment reason.
+
+An auxiliary receiver can instead sweep several centers in one persistent
+`rtl_433` process. Supply `frequencies_mhz` instead of `frequency_mhz`, plus a
+hop interval from 5 through 3600 seconds:
+
+```json
+{
+  "serial": "AUX1",
+  "frequencies_mhz": [905.2, 906.8, 910.0, 911.6, 913.2],
+  "hop_seconds": 120,
+  "gain": 70,
+  "filename": "discovery.jsonl"
+}
+```
+
+The status response reports the complete frequency list and hop interval. Each
+decoded packet retains rtl_433's measured `freq1` and `freq2`, allowing discovery
+results to be grouped by their actual channel midpoint.
 
 Inspect or stop managed captures:
 
