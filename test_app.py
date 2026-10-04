@@ -4,7 +4,10 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +22,7 @@ Config = orion_meter_reader.Config
 ReadingStore = orion_meter_reader.ReadingStore
 Receiver = orion_meter_reader.Receiver
 RadioManager = orion_meter_reader.RadioManager
+AppServer = orion_meter_reader.AppServer
 decorate_event = orion_meter_reader.decorate_event
 canonical_frequency_mhz = orion_meter_reader.canonical_frequency_mhz
 APP_VERSION = orion_meter_reader.APP_VERSION
@@ -193,6 +197,29 @@ class ReceiverTests(unittest.TestCase):
             self.assertNotIn("id", adjustment)
             command = receiver.command()
             self.assertEqual(command[command.index("-f") + 1], "921.6M")
+
+    def test_authenticated_retune_requests_immediate_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                frequency="921.2M",
+                data_file=Path(directory) / "readings.jsonl",
+            )
+            receiver = Receiver(config, ReadingStore(config))
+            process = FakeProcess()
+            receiver.process = process
+            receiver.running = True
+
+            result = receiver.retune(922.4)
+
+            self.assertTrue(result["changed"])
+            self.assertTrue(result["restart_requested"])
+            self.assertFalse(result["persistent"])
+            self.assertTrue(process.terminated)
+            self.assertEqual(receiver.current_frequency_mhz, 922.4)
+            command = receiver.command()
+            self.assertEqual(command[command.index("-f") + 1], "922.4M")
+            self.assertNotIn("serial", result)
 
     def test_recenter_ignores_unconfigured_meter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -382,6 +409,58 @@ class RadioManagerTests(unittest.TestCase):
                     frequencies_mhz=[905.2, 910.0],
                     hop_seconds=1,
                 )
+
+
+class ApiTests(unittest.TestCase):
+    def test_production_retune_needs_token_but_not_auxiliary_serials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                frequency="921.2M",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+            )
+            store = ReadingStore(config)
+            receiver = Receiver(config, store)
+            server = AppServer(
+                ("127.0.0.1", 0),
+                store,
+                receiver,
+                RadioManager(config),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/api/receiver"
+            try:
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps({"frequency_mhz": 922.4}).encode(),
+                    headers={
+                        "Authorization": "Bearer test-token",
+                        "Content-Type": "application/json",
+                    },
+                    method="PUT",
+                )
+                with urllib.request.urlopen(request) as response:
+                    payload = json.load(response)
+                self.assertTrue(payload["changed"])
+                self.assertEqual(payload["frequency_mhz"], 922.4)
+                self.assertEqual(receiver.current_frequency_mhz, 922.4)
+
+                unauthorized = urllib.request.Request(
+                    url,
+                    data=json.dumps({"frequency_mhz": 923.0}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="PUT",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(unauthorized)
+                self.assertEqual(caught.exception.code, 401)
+                caught.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":

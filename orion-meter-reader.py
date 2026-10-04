@@ -378,9 +378,12 @@ class Receiver:
         self.decode_errors = 0
         self.write_errors = 0
         self.current_frequency_mhz = configured_frequency_mhz(config.frequency)
+        self.frequency_generation = 0
+        self.restart_event = threading.Event()
         self.frequency_observations: deque[tuple[float, float]] = deque()
         self.last_recenter_monotonic: float | None = None
         self.last_recenter_at: str | None = None
+        self.last_adjustment_at: str | None = None
         self.auto_recenter_disabled_reason: str | None = None
         if config.auto_recenter_enabled:
             if len(config.meter_ids) != 1:
@@ -500,8 +503,10 @@ class Receiver:
             if not MIN_CONTROL_FREQUENCY_MHZ <= new_frequency <= MAX_CONTROL_FREQUENCY_MHZ:
                 return None
             self.current_frequency_mhz = new_frequency
+            self.frequency_generation += 1
             self.last_recenter_monotonic = observed_at
             self.last_recenter_at = utc_now()
+            self.last_adjustment_at = self.last_recenter_at
             packet_count = len(self.frequency_observations)
             self.frequency_observations.clear()
             return {
@@ -514,6 +519,53 @@ class Receiver:
                 "reason": "rolling packet midpoint exceeded configured threshold",
             }
 
+    def retune(self, frequency_mhz: Any) -> dict[str, Any]:
+        """Retune the production receiver and request an immediate restart."""
+        new_frequency = float(canonical_frequency_mhz(frequency_mhz))
+        with self.lock:
+            old_frequency = self.current_frequency_mhz
+            if new_frequency == old_frequency:
+                return {
+                    "receiver": "production",
+                    "changed": False,
+                    "frequency_mhz": new_frequency,
+                    "restart_requested": False,
+                    "persistent": False,
+                }
+
+            self.current_frequency_mhz = new_frequency
+            self.frequency_generation += 1
+            self.frequency_observations.clear()
+            self.last_recenter_monotonic = time.monotonic()
+            self.last_adjustment_at = utc_now()
+            process = self.process
+            restart_requested = process is not None and process.poll() is None
+            self.restart_event.set()
+
+        adjustment = {
+            "action": "retune",
+            "receiver": "production",
+            "old_frequency_mhz": old_frequency,
+            "new_frequency_mhz": new_frequency,
+            "reason": "authenticated radio-control API",
+        }
+        print(
+            "radio_adjustment " + json.dumps(adjustment, sort_keys=True),
+            flush=True,
+        )
+        if restart_requested:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+        return {
+            "receiver": "production",
+            "changed": True,
+            "frequency_mhz": new_frequency,
+            "restart_requested": restart_requested,
+            "persistent": False,
+        }
+
     def start(self) -> None:
         if self.auto_recenter_disabled_reason:
             print(
@@ -524,14 +576,19 @@ class Receiver:
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
+            with self.lock:
+                self.restart_event.clear()
+                frequency_generation = self.frequency_generation
+                command = self.command()
+                starting_frequency = self.current_frequency_mhz
             print(
                 "Starting rtl_433 receiver "
-                f"at {canonical_frequency_mhz(self.current_frequency_mhz)} MHz",
+                f"at {canonical_frequency_mhz(starting_frequency)} MHz",
                 flush=True,
             )
             try:
                 process = subprocess.Popen(
-                    self.command(),
+                    command,
                     stdout=subprocess.PIPE,
                     stderr=None,
                     text=True,
@@ -550,6 +607,9 @@ class Receiver:
                 self.running = True
                 self.started_at = utc_now()
                 self.last_error = None
+                stale_command = self.frequency_generation != frequency_generation
+            if stale_command:
+                process.terminate()
 
             planned_recenter: dict[str, Any] | None = None
             assert process.stdout is not None
@@ -589,18 +649,19 @@ class Receiver:
 
             return_code = process.wait()
             with self.lock:
+                retune_requested = self.frequency_generation != frequency_generation
                 self.process = None
                 self.running = False
-                if planned_recenter is not None:
+                if planned_recenter is not None or retune_requested:
                     self.last_error = None
                 elif not self.stop_event.is_set():
                     self.restart_count += 1
                     self.last_error = f"rtl_433 exited with status {return_code}"
-            if planned_recenter is not None:
+            if planned_recenter is not None or retune_requested:
                 continue
             if not self.stop_event.is_set():
                 print(f"{self.last_error}; restarting in 5 seconds", flush=True)
-                self.stop_event.wait(5)
+                self.restart_event.wait(5)
 
     def status(self) -> dict[str, Any]:
         """Return receiver health without exposing configuration identifiers."""
@@ -619,10 +680,12 @@ class Receiver:
                 "auto_recenter_enabled": self.auto_recenter_active,
                 "auto_recenter_disabled_reason": self.auto_recenter_disabled_reason,
                 "last_recenter_at": self.last_recenter_at,
+                "last_adjustment_at": self.last_adjustment_at,
             }
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.restart_event.set()
         with self.lock:
             process = self.process
         if process and process.poll() is None:
@@ -948,14 +1011,23 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _require_radio_control(self) -> bool:
+    def _require_radio_control(self, *, require_auxiliary: bool = False) -> bool:
         manager = self.server.radio_manager
-        if not manager.enabled:
+        if not manager.config.radio_control_token:
             self._json(
                 503,
                 {
                     "error": "Radio control is disabled. Configure "
-                    "RADIO_CONTROL_TOKEN and RADIO_CONTROL_SERIALS."
+                    "RADIO_CONTROL_TOKEN."
+                },
+            )
+            return False
+        if require_auxiliary and not manager.config.radio_control_serials:
+            self._json(
+                503,
+                {
+                    "error": "Auxiliary radio control is disabled. Configure "
+                    "RADIO_CONTROL_SERIALS."
                 },
             )
             return False
@@ -1060,6 +1132,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "/readings",
                         "/files",
                         "/files/{filename}",
+                        "/api/receiver",
                         "/api/radios",
                         "/api/radios/{name}",
                     ],
@@ -1069,6 +1142,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             status = self.server.receiver.status()
             self._json(200 if status["running"] else 503, status)
+            return
+        if path == "/api/receiver":
+            if not self._require_radio_control():
+                return
+            self._json(200, self.server.receiver.status())
             return
         if path == "/api/readings":
             self._json(200, self.server.store.snapshot())
@@ -1109,7 +1187,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._data_file(data_file)
             return
         if path == "/api/radios":
-            if not self._require_radio_control():
+            if not self._require_radio_control(require_auxiliary=True):
                 return
             radios = self.server.radio_manager.statuses()
             self._json(200, {"count": len(radios), "radios": radios})
@@ -1118,10 +1196,23 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = (urlparse(self.path).path.rstrip("/") or "/")
+        if path == "/api/receiver":
+            if not self._require_radio_control():
+                return
+            try:
+                payload = self._request_json()
+                status = self.server.receiver.retune(
+                    payload.get("frequency_mhz")
+                )
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            self._json(200, status)
+            return
         if not path.startswith("/api/radios/"):
             self._json(404, {"error": "Not found"})
             return
-        if not self._require_radio_control():
+        if not self._require_radio_control(require_auxiliary=True):
             return
         name = path.removeprefix("/api/radios/")
         try:
@@ -1148,7 +1239,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not path.startswith("/api/radios/"):
             self._json(404, {"error": "Not found"})
             return
-        if not self._require_radio_control():
+        if not self._require_radio_control(require_auxiliary=True):
             return
         name = path.removeprefix("/api/radios/")
         try:

@@ -200,15 +200,33 @@ The endpoint snapshot may not occur at civil midnight, so
 `usage_since_snapshot_gallons` should not automatically be treated as calendar-day
 usage.
 
-## Auxiliary radio control API
+## Authenticated radio control API
 
-For frequency-hopping experiments, the service can safely start, retune, inspect,
-and stop auxiliary RTL-SDR capture processes. It does not accept shell commands,
-it only permits frequencies from 902 through 928 MHz, and it refuses to retune
-the production receiver configured by `SDR_SERIAL`.
+Set `RADIO_CONTROL_TOKEN` to enable authenticated runtime control of the
+production receiver. Retune it with `PUT /api/receiver`:
 
-Create a strong token, then add the token and the permitted auxiliary SDR serials
-to `.env`:
+```json
+{
+  "frequency_mhz": 922.4
+}
+```
+
+The service validates the 902 through 928 MHz range, logs a `radio_adjustment`
+entry, stops the current `rtl_433` process, and immediately restarts it at the
+new center. This is a runtime change: a container restart returns to the
+`FREQUENCY` value in `.env`, so update that value as well when the change should
+persist. An authenticated `GET /api/receiver` returns its current status.
+
+For frequency-hopping experiments, the same API can safely start, retune,
+inspect, and stop auxiliary RTL-SDR capture processes. Add their serials to
+`RADIO_CONTROL_SERIALS`; production retuning does not require that list.
+
+The API does not accept shell commands and only permits frequencies from 902
+through 928 MHz. The auxiliary endpoints refuse to operate on the production
+receiver configured by `SDR_SERIAL`.
+
+Create a strong token, then add it to `.env`. Add permitted auxiliary SDR
+serials only when those endpoints are needed:
 
 ```sh
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
