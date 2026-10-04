@@ -112,8 +112,8 @@ Gain `0` selects automatic gain; a supported fixed gain can be configured with
 Automatic recentering can follow slow movement of a fixed receiver's decoded
 channel. It is opt-in, requires exactly one configured `METER_IDS` value, and is
 disabled whenever `RTL433_EXTRA_ARGS` contains rtl_433 frequency-hopping options.
-It does not discover a completely silent channel; use a separate scanning radio
-for discovery.
+An optional silence seeker can cycle the same production radio through configured
+centers when no matching packets remain available to guide recentering.
 
 For a fixed production receiver, configure:
 
@@ -125,13 +125,19 @@ AUTO_RECENTER_THRESHOLD_MHZ=0.35
 AUTO_RECENTER_MIN_PACKETS=5
 AUTO_RECENTER_WINDOW_SECONDS=300
 AUTO_RECENTER_COOLDOWN_SECONDS=900
+AUTO_SEEK_ENABLED=true
+AUTO_SEEK_SILENCE_SECONDS=180
+AUTO_SEEK_FREQUENCIES_MHZ=904.8,906.4,908.0,909.6,911.2,912.8,914.4,916.0,917.6,919.2,920.8,922.4,924.0
 ```
 
 After the required number of matching packets moves beyond the threshold, the
 service rounds their median channel midpoint to 0.1 MHz, restarts only the
 `rtl_433` child process at that center, and enforces the cooldown. Every automatic
 or API-requested adjustment writes a `radio_adjustment` JSON object to the
-container log. Meter identifiers are not included in adjustment log entries.
+container log. After three minutes without a matching packet, the seeker moves
+to the next configured center and waits another three minutes. It stops cycling
+as soon as reception resumes. Meter identifiers are not included in adjustment
+log entries.
 
 ## Build and run
 

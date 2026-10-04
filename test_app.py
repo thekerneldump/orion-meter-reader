@@ -66,6 +66,25 @@ class ConfigTests(unittest.TestCase):
             config = Config.from_env()
         self.assertEqual(config.rtl433_extra_args, ())
 
+    def test_loads_silence_seek_configuration(self):
+        with mock.patch.dict(
+            orion_meter_reader.os.environ,
+            {
+                "SDR_SERIAL": "ORION",
+                "AUTO_SEEK_ENABLED": "true",
+                "AUTO_SEEK_SILENCE_SECONDS": "180",
+                "AUTO_SEEK_FREQUENCIES_MHZ": "904.8,910.0,922.4",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+        self.assertTrue(config.auto_seek_enabled)
+        self.assertEqual(config.auto_seek_silence_seconds, 180)
+        self.assertEqual(
+            config.auto_seek_frequencies_mhz,
+            (904.8, 910.0, 922.4),
+        )
+
 
 class ConversionTests(unittest.TestCase):
     def test_protocol_290_counter_conversion(self):
@@ -220,6 +239,35 @@ class ReceiverTests(unittest.TestCase):
             command = receiver.command()
             self.assertEqual(command[command.index("-f") + 1], "922.4M")
             self.assertNotIn("serial", result)
+
+    def test_seeks_next_center_after_three_minutes_without_packets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                frequency="922.4M",
+                meter_ids=frozenset({"12345678"}),
+                data_file=Path(directory) / "readings.jsonl",
+                auto_seek_enabled=True,
+                auto_seek_silence_seconds=180,
+                auto_seek_frequencies_mhz=(904.8, 906.4, 922.4, 924.0),
+                auto_recenter_enabled=True,
+            )
+            receiver = Receiver(config, ReadingStore(config))
+            process = FakeProcess()
+            receiver.process = process
+            receiver.running = True
+            receiver.last_matching_packet_monotonic = 0
+
+            self.assertIsNone(receiver.seek_if_silent(now=179))
+            adjustment = receiver.seek_if_silent(now=180)
+
+            self.assertIsNotNone(adjustment)
+            self.assertEqual(adjustment["frequency_mhz"], 924.0)
+            self.assertTrue(process.terminated)
+            self.assertIsNotNone(receiver.last_seek_at)
+            self.assertIsNone(receiver.last_recenter_monotonic)
+            command = receiver.command()
+            self.assertEqual(command[command.index("-f") + 1], "924M")
 
     def test_recenter_ignores_unconfigured_meter(self):
         with tempfile.TemporaryDirectory() as directory:

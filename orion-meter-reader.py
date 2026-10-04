@@ -30,6 +30,21 @@ RADIO_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 SDR_SERIAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MIN_CONTROL_FREQUENCY_MHZ = 902.0
 MAX_CONTROL_FREQUENCY_MHZ = 928.0
+DEFAULT_AUTO_SEEK_FREQUENCIES_MHZ = (
+    904.8,
+    906.4,
+    908.0,
+    909.6,
+    911.2,
+    912.8,
+    914.4,
+    916.0,
+    917.6,
+    919.2,
+    920.8,
+    922.4,
+    924.0,
+)
 
 
 def utc_now() -> str:
@@ -62,6 +77,38 @@ def env_bool(name: str, default: bool = False) -> bool:
     raise SystemExit(f"{name} must be true or false, got {value!r}")
 
 
+def env_frequency_list(
+    name: str,
+    default: tuple[float, ...],
+) -> tuple[float, ...]:
+    """Load and validate a comma-separated list of MHz center frequencies."""
+    raw_values = os.getenv(name, ",".join(str(value) for value in default))
+    values: list[float] = []
+    for raw_value in raw_values.split(","):
+        raw_value = raw_value.strip()
+        if not raw_value:
+            continue
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise SystemExit(
+                f"{name} must contain comma-separated numbers"
+            ) from exc
+        if not math.isfinite(value):
+            raise SystemExit(f"{name} values must be finite")
+        if not MIN_CONTROL_FREQUENCY_MHZ <= value <= MAX_CONTROL_FREQUENCY_MHZ:
+            raise SystemExit(
+                f"{name} values must be between {MIN_CONTROL_FREQUENCY_MHZ:g} "
+                f"and {MAX_CONTROL_FREQUENCY_MHZ:g}"
+            )
+        values.append(value)
+    if len(set(values)) < 2:
+        raise SystemExit(f"{name} must contain at least two unique frequencies")
+    if len(values) != len(set(values)):
+        raise SystemExit(f"{name} cannot contain duplicate frequencies")
+    return tuple(values)
+
+
 @dataclass(frozen=True)
 class Config:
     """Application configuration."""
@@ -85,6 +132,11 @@ class Config:
     auto_recenter_min_packets: int = 5
     auto_recenter_window_seconds: int = 300
     auto_recenter_cooldown_seconds: int = 900
+    auto_seek_enabled: bool = False
+    auto_seek_silence_seconds: int = 180
+    auto_seek_frequencies_mhz: tuple[float, ...] = (
+        DEFAULT_AUTO_SEEK_FREQUENCIES_MHZ
+    )
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -137,6 +189,14 @@ class Config:
             ),
             auto_recenter_cooldown_seconds=env_int(
                 "AUTO_RECENTER_COOLDOWN_SECONDS", 900
+            ),
+            auto_seek_enabled=env_bool("AUTO_SEEK_ENABLED"),
+            auto_seek_silence_seconds=env_int(
+                "AUTO_SEEK_SILENCE_SECONDS", 180
+            ),
+            auto_seek_frequencies_mhz=env_frequency_list(
+                "AUTO_SEEK_FREQUENCIES_MHZ",
+                DEFAULT_AUTO_SEEK_FREQUENCIES_MHZ,
             ),
         )
 
@@ -384,7 +444,15 @@ class Receiver:
         self.last_recenter_monotonic: float | None = None
         self.last_recenter_at: str | None = None
         self.last_adjustment_at: str | None = None
+        self.last_matching_packet_monotonic = time.monotonic()
+        self.last_seek_at: str | None = None
         self.auto_recenter_disabled_reason: str | None = None
+        self.auto_seek_disabled_reason: str | None = None
+        self.seek_thread = threading.Thread(
+            target=self._seek_loop,
+            name="rtl433-seek",
+            daemon=True,
+        )
         if config.auto_recenter_enabled:
             if len(config.meter_ids) != 1:
                 self.auto_recenter_disabled_reason = (
@@ -410,6 +478,19 @@ class Receiver:
                 self.auto_recenter_disabled_reason = (
                     "AUTO_RECENTER_COOLDOWN_SECONDS cannot be negative"
                 )
+        if config.auto_seek_enabled:
+            if len(config.meter_ids) != 1:
+                self.auto_seek_disabled_reason = (
+                    "AUTO_SEEK_ENABLED requires exactly one METER_IDS value"
+                )
+            elif "-f" in config.rtl433_extra_args or "-H" in config.rtl433_extra_args:
+                self.auto_seek_disabled_reason = (
+                    "automatic seeking cannot be combined with rtl_433 frequency hopping"
+                )
+            elif config.auto_seek_silence_seconds < 15:
+                self.auto_seek_disabled_reason = (
+                    "AUTO_SEEK_SILENCE_SECONDS must be at least 15"
+                )
 
     @property
     def auto_recenter_active(self) -> bool:
@@ -417,6 +498,10 @@ class Receiver:
             self.config.auto_recenter_enabled
             and self.auto_recenter_disabled_reason is None
         )
+
+    @property
+    def auto_seek_active(self) -> bool:
+        return self.config.auto_seek_enabled and self.auto_seek_disabled_reason is None
 
     def command(self) -> list[str]:
         """Build the rtl_433 command line."""
@@ -519,9 +604,17 @@ class Receiver:
                 "reason": "rolling packet midpoint exceeded configured threshold",
             }
 
-    def retune(self, frequency_mhz: Any) -> dict[str, Any]:
+    def retune(
+        self,
+        frequency_mhz: Any,
+        *,
+        reason: str = "authenticated radio-control API",
+        now: float | None = None,
+        apply_recenter_cooldown: bool = True,
+    ) -> dict[str, Any]:
         """Retune the production receiver and request an immediate restart."""
         new_frequency = float(canonical_frequency_mhz(frequency_mhz))
+        adjusted_at = time.monotonic() if now is None else now
         with self.lock:
             old_frequency = self.current_frequency_mhz
             if new_frequency == old_frequency:
@@ -536,8 +629,10 @@ class Receiver:
             self.current_frequency_mhz = new_frequency
             self.frequency_generation += 1
             self.frequency_observations.clear()
-            self.last_recenter_monotonic = time.monotonic()
+            if apply_recenter_cooldown:
+                self.last_recenter_monotonic = adjusted_at
             self.last_adjustment_at = utc_now()
+            self.last_matching_packet_monotonic = adjusted_at
             process = self.process
             restart_requested = process is not None and process.poll() is None
             self.restart_event.set()
@@ -547,7 +642,7 @@ class Receiver:
             "receiver": "production",
             "old_frequency_mhz": old_frequency,
             "new_frequency_mhz": new_frequency,
-            "reason": "authenticated radio-control API",
+            "reason": reason,
         }
         print(
             "radio_adjustment " + json.dumps(adjustment, sort_keys=True),
@@ -566,13 +661,57 @@ class Receiver:
             "persistent": False,
         }
 
+    def seek_if_silent(self, *, now: float | None = None) -> dict[str, Any] | None:
+        """Move to the next configured center after sustained packet silence."""
+        if not self.auto_seek_active:
+            return None
+        observed_at = time.monotonic() if now is None else now
+        with self.lock:
+            silence_seconds = observed_at - self.last_matching_packet_monotonic
+            if silence_seconds < self.config.auto_seek_silence_seconds:
+                return None
+            frequencies = self.config.auto_seek_frequencies_mhz
+            nearest_index = min(
+                range(len(frequencies)),
+                key=lambda index: abs(
+                    frequencies[index] - self.current_frequency_mhz
+                ),
+            )
+            next_frequency = frequencies[(nearest_index + 1) % len(frequencies)]
+            self.last_matching_packet_monotonic = observed_at
+            self.last_seek_at = utc_now()
+            self.last_recenter_monotonic = None
+        return self.retune(
+            next_frequency,
+            reason=(
+                "no matching packets for "
+                f"{self.config.auto_seek_silence_seconds} seconds"
+            ),
+            now=observed_at,
+            apply_recenter_cooldown=False,
+        )
+
+    def _seek_loop(self) -> None:
+        interval = min(5.0, max(1.0, self.config.auto_seek_silence_seconds / 4))
+        while not self.stop_event.wait(interval):
+            self.seek_if_silent()
+
     def start(self) -> None:
         if self.auto_recenter_disabled_reason:
             print(
                 f"Automatic recentering disabled: {self.auto_recenter_disabled_reason}",
                 flush=True,
             )
+        if self.auto_seek_disabled_reason:
+            print(
+                f"Automatic seeking disabled: {self.auto_seek_disabled_reason}",
+                flush=True,
+            )
+        with self.lock:
+            self.last_matching_packet_monotonic = time.monotonic()
         self.thread.start()
+        if self.auto_seek_active:
+            self.seek_thread.start()
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -637,6 +776,7 @@ class Receiver:
                 if event is not None:
                     with self.lock:
                         self.last_packet_at = utc_now()
+                        self.last_matching_packet_monotonic = time.monotonic()
                     planned_recenter = self.observe_frequency(raw_event)
                     if planned_recenter is not None:
                         print(
@@ -681,6 +821,10 @@ class Receiver:
                 "auto_recenter_disabled_reason": self.auto_recenter_disabled_reason,
                 "last_recenter_at": self.last_recenter_at,
                 "last_adjustment_at": self.last_adjustment_at,
+                "auto_seek_enabled": self.auto_seek_active,
+                "auto_seek_disabled_reason": self.auto_seek_disabled_reason,
+                "auto_seek_silence_seconds": self.config.auto_seek_silence_seconds,
+                "last_seek_at": self.last_seek_at,
             }
 
     def stop(self) -> None:
@@ -695,6 +839,8 @@ class Receiver:
             except subprocess.TimeoutExpired:
                 process.kill()
         self.thread.join(timeout=6)
+        if self.seek_thread.is_alive():
+            self.seek_thread.join(timeout=2)
 
 
 @dataclass
