@@ -256,7 +256,8 @@ named capture with `PUT /api/radios/demo` and a JSON body:
 {
   "serial": "AUX1",
   "frequency_mhz": 904.8,
-  "gain": 70
+  "gain": 70,
+  "publish_meter_ids": [12345678]
 }
 ```
 
@@ -264,6 +265,13 @@ The default output filename is derived from the frequency, such as
 `904.8MHz.jsonl`. An optional `filename` property may specify another simple
 `.jsonl` filename. Sending another `PUT` to the same named radio stops its old
 process, retunes it, and appends to the new frequency's file.
+
+Auxiliary captures always retain every decoded packet in their JSONL file.
+`publish_meter_ids` is an optional allowlist of selected auxiliary endpoints to
+also publish through `/api/readings`. Integrations polling that endpoint can then
+discover those meters without changing the production `METER_IDS` filter. The
+allowlist applies only to that managed radio and lasts until it is stopped or the
+container restarts.
 
 Each start or retune also writes a `radio_adjustment` entry to the container log
 with the previous center, new center, and adjustment reason.

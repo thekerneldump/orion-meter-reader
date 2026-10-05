@@ -1,6 +1,7 @@
 """Unit tests for the Orion Meter Reader service."""
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -29,9 +30,10 @@ APP_VERSION = orion_meter_reader.APP_VERSION
 
 
 class FakeProcess:
-    def __init__(self):
+    def __init__(self, output=""):
         self.exit_code = None
         self.terminated = False
+        self.stdout = io.StringIO(output)
 
     def poll(self):
         return self.exit_code
@@ -456,6 +458,67 @@ class RadioManagerTests(unittest.TestCase):
                     serial="AUX1",
                     frequencies_mhz=[905.2, 910.0],
                     hop_seconds=1,
+                )
+
+    def test_publishes_only_allowlisted_auxiliary_meter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            config = Config(
+                sdr_serial="ORION",
+                meter_ids=frozenset({"11111111"}),
+                data_file=path,
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            store = ReadingStore(config)
+            raw_events = "".join(
+                json.dumps(event) + "\n"
+                for event in (
+                    {"id": 22222222, "reading": 100},
+                    {"id": 33333333, "reading": 200},
+                )
+            )
+            process = FakeProcess(raw_events)
+            manager = RadioManager(config, store)
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=process,
+            ):
+                status = manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequency_mhz=916.4,
+                    filename="discovery.jsonl",
+                    publish_meter_ids=[22222222],
+                )
+
+            manager.captures["scanner"].output_thread.join(timeout=2)
+            self.assertEqual(status["published_meter_count"], 1)
+            self.assertNotIn("publish_meter_ids", status)
+            self.assertIn("22222222", store.snapshot())
+            self.assertNotIn("33333333", store.snapshot())
+            self.assertEqual(len(path.read_text().splitlines()), 1)
+            self.assertEqual(
+                len((Path(directory) / "discovery.jsonl").read_text().splitlines()),
+                2,
+            )
+
+    def test_rejects_invalid_publish_meter_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            with self.assertRaisesRegex(ValueError, "JSON array"):
+                manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequency_mhz=916.4,
+                    publish_meter_ids="22222222",
                 )
 
 

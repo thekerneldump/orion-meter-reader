@@ -319,11 +319,9 @@ class ReadingStore:
                 source.replace(path.with_name(f"{path.name}.{index + 1}"))
         path.replace(path.with_name(f"{path.name}.1"))
 
-    def record(self, raw_event: dict[str, Any]) -> dict[str, Any] | None:
+    def _persist(self, raw_event: dict[str, Any]) -> dict[str, Any] | None:
         event_id = meter_id(raw_event)
         if not event_id:
-            return None
-        if self.config.meter_ids and event_id not in self.config.meter_ids:
             return None
 
         event = decorate_event(raw_event)
@@ -337,6 +335,26 @@ class ReadingStore:
             self.latest[event_id] = event
             self.events_written += 1
         return event
+
+    def record(self, raw_event: dict[str, Any]) -> dict[str, Any] | None:
+        """Record an event accepted by the production meter filter."""
+        event_id = meter_id(raw_event)
+        if not event_id:
+            return None
+        if self.config.meter_ids and event_id not in self.config.meter_ids:
+            return None
+        return self._persist(raw_event)
+
+    def record_selected(
+        self,
+        raw_event: dict[str, Any],
+        allowed_meter_ids: frozenset[str],
+    ) -> dict[str, Any] | None:
+        """Record an auxiliary event only when explicitly allowlisted."""
+        event_id = meter_id(raw_event)
+        if not event_id or event_id not in allowed_meter_ids:
+            return None
+        return self._persist(raw_event)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         with self.lock:
@@ -854,6 +872,8 @@ class ManagedCapture:
     filename: str
     started_at: str
     process: subprocess.Popen[Any]
+    output_thread: threading.Thread
+    publish_meter_ids: frozenset[str]
 
     def status(self) -> dict[str, Any]:
         exit_code = self.process.poll()
@@ -872,14 +892,16 @@ class ManagedCapture:
             "started_at": self.started_at,
             "running": exit_code is None,
             "exit_code": exit_code,
+            "published_meter_count": len(self.publish_meter_ids),
         }
 
 
 class RadioManager:
     """Safely manage auxiliary SDR capture processes."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, store: ReadingStore | None = None):
         self.config = config
+        self.store = store
         self.data_directory = config.data_file.parent.resolve()
         self.lock = threading.RLock()
         self.captures: dict[str, ManagedCapture] = {}
@@ -968,6 +990,59 @@ class RadioManager:
             raise ValueError("hop_seconds must be between 5 and 3600")
         return seconds
 
+    def _validate_publish_meter_ids(self, value: Any) -> frozenset[str]:
+        if value is None:
+            return frozenset()
+        if not isinstance(value, list):
+            raise ValueError("publish_meter_ids must be a JSON array")
+        if len(value) > 32:
+            raise ValueError("publish_meter_ids cannot contain more than 32 values")
+        meter_ids: list[str] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (int, str)):
+                raise ValueError("publish_meter_ids values must be meter IDs")
+            event_id = str(item).strip()
+            if not event_id.isdigit() or len(event_id) > 32:
+                raise ValueError("publish_meter_ids values must be numeric meter IDs")
+            meter_ids.append(event_id)
+        if len(meter_ids) != len(set(meter_ids)):
+            raise ValueError("publish_meter_ids cannot contain duplicates")
+        return frozenset(meter_ids)
+
+    def _consume_output(
+        self,
+        name: str,
+        process: subprocess.Popen[str],
+        path: Path,
+        publish_meter_ids: frozenset[str],
+    ) -> None:
+        """Tee auxiliary JSON to disk and publish selected meter events."""
+        assert process.stdout is not None
+        try:
+            with path.open("a", encoding="utf-8") as output:
+                for line in process.stdout:
+                    output.write(line)
+                    output.flush()
+                    if not publish_meter_ids or self.store is None:
+                        continue
+                    try:
+                        event = json.loads(line)
+                        if not isinstance(event, dict):
+                            continue
+                        self.store.record_selected(
+                            event,
+                            publish_meter_ids,
+                        )
+                    except json.JSONDecodeError:
+                        continue
+                    except OSError as exc:
+                        print(
+                            f"Could not publish auxiliary reading from {name}: {exc}",
+                            flush=True,
+                        )
+        except OSError as exc:
+            print(f"Could not write auxiliary capture {name}: {exc}", flush=True)
+
     def _stop_locked(self, name: str) -> bool:
         capture = self.captures.pop(name, None)
         if capture is None:
@@ -980,6 +1055,7 @@ class RadioManager:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+        capture.output_thread.join(timeout=2)
         return True
 
     def start(
@@ -992,6 +1068,7 @@ class RadioManager:
         hop_seconds: Any = None,
         gain: Any = None,
         filename: Any = None,
+        publish_meter_ids: Any = None,
     ) -> dict[str, Any]:
         """Start or retune a named auxiliary receiver."""
         self._validate_name(name)
@@ -1006,6 +1083,9 @@ class RadioManager:
         )
         safe_gain = canonical_gain(
             self.config.gain if gain is None else gain
+        )
+        safe_publish_meter_ids = self._validate_publish_meter_ids(
+            publish_meter_ids
         )
         path = self._capture_path(filename, safe_frequency)
         command = [
@@ -1051,21 +1131,32 @@ class RadioManager:
             self._stop_locked(name)
             self.data_directory.mkdir(parents=True, exist_ok=True)
             try:
-                with path.open("a", encoding="utf-8") as output:
-                    process = subprocess.Popen(
-                        command,
-                        stdout=output,
-                        stderr=None,
-                        text=True,
-                    )
+                with path.open("a", encoding="utf-8"):
+                    pass
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=None,
+                    text=True,
+                    bufsize=1,
+                )
             except OSError as exc:
                 raise RuntimeError(f"could not start rtl_433: {exc}") from exc
+
+            output_thread = threading.Thread(
+                target=self._consume_output,
+                args=(name, process, path, safe_publish_meter_ids),
+                name=f"rtl433-{name}",
+                daemon=True,
+            )
+            output_thread.start()
 
             try:
                 return_code = process.wait(timeout=0.25)
             except subprocess.TimeoutExpired:
                 pass
             else:
+                output_thread.join(timeout=2)
                 raise RuntimeError(
                     f"rtl_433 exited immediately with status {return_code}; "
                     "check the container logs"
@@ -1079,6 +1170,8 @@ class RadioManager:
                 filename=path.name,
                 started_at=utc_now(),
                 process=process,
+                output_thread=output_thread,
+                publish_meter_ids=safe_publish_meter_ids,
             )
             self.captures[name] = capture
             print(
@@ -1092,6 +1185,7 @@ class RadioManager:
                             float(value) for value in safe_frequencies
                         ],
                         "hop_seconds": safe_hop_seconds,
+                        "published_meter_count": len(safe_publish_meter_ids),
                         "reason": "authenticated radio-control API",
                     },
                     sort_keys=True,
@@ -1371,6 +1465,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 hop_seconds=payload.get("hop_seconds"),
                 gain=payload.get("gain"),
                 filename=payload.get("filename"),
+                publish_meter_ids=payload.get("publish_meter_ids"),
             )
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
@@ -1407,7 +1502,7 @@ def main() -> None:
     config = Config.from_env()
     store = ReadingStore(config)
     receiver = Receiver(config, store)
-    radio_manager = RadioManager(config)
+    radio_manager = RadioManager(config, store)
     server = AppServer(
         (config.http_host, config.http_port),
         store,
