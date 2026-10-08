@@ -257,7 +257,8 @@ named capture with `PUT /api/radios/demo` and a JSON body:
   "serial": "AUX1",
   "frequency_mhz": 904.8,
   "gain": 70,
-  "publish_meter_ids": [12345678]
+  "publish_meter_ids": [12345678],
+  "persistent": true
 }
 ```
 
@@ -269,9 +270,18 @@ process, retunes it, and appends to the new frequency's file.
 Auxiliary captures always retain every decoded packet in their JSONL file.
 `publish_meter_ids` is an optional allowlist of selected auxiliary endpoints to
 also publish through `/api/readings`. Integrations polling that endpoint can then
-discover those meters without changing the production `METER_IDS` filter. The
-allowlist applies only to that managed radio and lasts until it is stopped or the
-container restarts.
+discover those meters without changing the production `METER_IDS` filter.
+
+To publish every valid endpoint decoded by that radio instead, set
+`"publish_all": true` and omit `publish_meter_ids`. These modes are mutually
+exclusive. Publishing all endpoints is convenient for discovery but exposes
+every nearby decoded meter through the API and downstream integrations; use an
+allowlist when that is not desired.
+
+Managed radios are persistent by default. Their non-secret configuration is
+saved in the mounted data directory and automatically restored when the service
+starts. Set `"persistent": false` for a temporary capture. Deleting a radio
+through the API stops it and removes its saved configuration.
 
 Each start or retune also writes a `radio_adjustment` entry to the container log
 with the previous center, new center, and adjustment reason.
@@ -286,13 +296,15 @@ hop interval from 5 through 3600 seconds:
   "frequencies_mhz": [905.2, 906.8, 910.0, 911.6, 913.2],
   "hop_seconds": 120,
   "gain": 70,
-  "filename": "discovery.jsonl"
+  "filename": "discovery.jsonl",
+  "publish_all": true
 }
 ```
 
-The status response reports the complete frequency list and hop interval. Each
-decoded packet retains rtl_433's measured `freq1` and `freq2`, allowing discovery
-results to be grouped by their actual channel midpoint.
+The status response reports the complete frequency list, hop interval,
+persistence, and publication mode. Each decoded packet retains rtl_433's
+measured `freq1` and `freq2`, allowing discovery results to be grouped by their
+actual channel midpoint.
 
 Inspect or stop managed captures:
 

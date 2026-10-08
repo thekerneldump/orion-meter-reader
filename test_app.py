@@ -504,6 +504,96 @@ class RadioManagerTests(unittest.TestCase):
                 2,
             )
 
+    def test_publishes_all_auxiliary_meters_when_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            config = Config(
+                sdr_serial="ORION",
+                meter_ids=frozenset({"11111111"}),
+                data_file=path,
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            store = ReadingStore(config)
+            process = FakeProcess(
+                json.dumps({"id": 22222222, "reading": 100})
+                + "\n"
+                + json.dumps({"id": 33333333, "reading": 200})
+                + "\n"
+            )
+            manager = RadioManager(config, store)
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=process,
+            ):
+                status = manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequency_mhz=916.4,
+                    filename="discovery.jsonl",
+                    publish_all=True,
+                    persistent=False,
+                )
+
+            manager.captures["scanner"].output_thread.join(timeout=2)
+            self.assertEqual(status["publish_mode"], "all")
+            self.assertIsNone(status["published_meter_count"])
+            self.assertEqual(set(store.snapshot()), {"22222222", "33333333"})
+
+    def test_restores_and_forgets_persistent_auxiliary_radio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            config = Config(
+                sdr_serial="ORION",
+                data_file=path,
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config, ReadingStore(config))
+            first_process = FakeProcess()
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=first_process,
+            ):
+                manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequencies_mhz=[911.5, 917.7, 923.6],
+                    hop_seconds=7,
+                    gain=20,
+                    filename="discovery.jsonl",
+                    publish_all=True,
+                )
+
+            state_file = path.with_name("managed-radios.json")
+            saved_text = state_file.read_text()
+            self.assertNotIn("test-token", saved_text)
+            self.assertEqual(
+                json.loads(saved_text)["radios"]["scanner"]["publish_all"],
+                True,
+            )
+            manager.stop_all()
+
+            restored = RadioManager(config, ReadingStore(config))
+            second_process = FakeProcess()
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=second_process,
+            ) as popen:
+                restored.restore_persistent()
+
+            status = restored.statuses()[0]
+            self.assertTrue(status["running"])
+            self.assertTrue(status["persistent"])
+            self.assertEqual(status["publish_mode"], "all")
+            command = popen.call_args.args[0]
+            self.assertEqual(command[command.index("-H") + 1], "7")
+            self.assertTrue(restored.stop("scanner"))
+            self.assertEqual(json.loads(state_file.read_text())["radios"], {})
+
     def test_rejects_invalid_publish_meter_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Config(
@@ -519,6 +609,21 @@ class RadioManagerTests(unittest.TestCase):
                     serial="AUX1",
                     frequency_mhz=916.4,
                     publish_meter_ids="22222222",
+                )
+            with self.assertRaisesRegex(ValueError, "cannot be used together"):
+                manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequency_mhz=916.4,
+                    publish_meter_ids=[22222222],
+                    publish_all=True,
+                )
+            with self.assertRaisesRegex(ValueError, "true or false"):
+                manager.start(
+                    "scanner",
+                    serial="AUX1",
+                    frequency_mhz=916.4,
+                    publish_all="true",
                 )
 
 

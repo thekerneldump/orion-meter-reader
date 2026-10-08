@@ -28,6 +28,8 @@ DATA_FILE_NAME_PATTERN = re.compile(
 )
 RADIO_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 SDR_SERIAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+RADIO_STATE_FILE_NAME = "managed-radios.json"
+RADIO_STATE_VERSION = 1
 MIN_CONTROL_FREQUENCY_MHZ = 902.0
 MAX_CONTROL_FREQUENCY_MHZ = 928.0
 DEFAULT_AUTO_SEEK_FREQUENCIES_MHZ = (
@@ -354,6 +356,13 @@ class ReadingStore:
         event_id = meter_id(raw_event)
         if not event_id or event_id not in allowed_meter_ids:
             return None
+        return self._persist(raw_event)
+
+    def record_unfiltered(
+        self,
+        raw_event: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Record an auxiliary meter event without the production allowlist."""
         return self._persist(raw_event)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
@@ -869,11 +878,33 @@ class ManagedCapture:
     serial: str
     frequencies_mhz: tuple[str, ...]
     hop_seconds: int | None
+    gain: str
     filename: str
     started_at: str
     process: subprocess.Popen[Any]
     output_thread: threading.Thread
     publish_meter_ids: frozenset[str]
+    publish_all: bool
+    persistent: bool
+
+    def persistent_config(self) -> dict[str, Any]:
+        """Return the non-secret configuration needed to restore this radio."""
+        config: dict[str, Any] = {
+            "serial": self.serial,
+            "hop_seconds": self.hop_seconds,
+            "gain": float(self.gain),
+            "filename": self.filename,
+            "publish_meter_ids": sorted(self.publish_meter_ids),
+            "publish_all": self.publish_all,
+            "persistent": True,
+        }
+        if len(self.frequencies_mhz) == 1:
+            config["frequency_mhz"] = float(self.frequencies_mhz[0])
+        else:
+            config["frequencies_mhz"] = [
+                float(value) for value in self.frequencies_mhz
+            ]
+        return config
 
     def status(self) -> dict[str, Any]:
         exit_code = self.process.poll()
@@ -892,7 +923,15 @@ class ManagedCapture:
             "started_at": self.started_at,
             "running": exit_code is None,
             "exit_code": exit_code,
-            "published_meter_count": len(self.publish_meter_ids),
+            "publish_mode": (
+                "all"
+                if self.publish_all
+                else "allowlist" if self.publish_meter_ids else "none"
+            ),
+            "published_meter_count": (
+                None if self.publish_all else len(self.publish_meter_ids)
+            ),
+            "persistent": self.persistent,
         }
 
 
@@ -903,8 +942,11 @@ class RadioManager:
         self.config = config
         self.store = store
         self.data_directory = config.data_file.parent.resolve()
+        self.state_file = self.data_directory / RADIO_STATE_FILE_NAME
         self.lock = threading.RLock()
         self.captures: dict[str, ManagedCapture] = {}
+        self.persistent_configs: dict[str, dict[str, Any]] = {}
+        self._load_persistent_configs()
 
     @property
     def enabled(self) -> bool:
@@ -1009,30 +1051,100 @@ class RadioManager:
             raise ValueError("publish_meter_ids cannot contain duplicates")
         return frozenset(meter_ids)
 
+    def _validate_boolean(
+        self,
+        value: Any,
+        name: str,
+        *,
+        default: bool,
+    ) -> bool:
+        if value is None:
+            return default
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be true or false")
+        return value
+
+    def _load_persistent_configs(self) -> None:
+        """Load desired auxiliary radios without starting them yet."""
+        if not self.state_file.exists():
+            return
+        if self.state_file.is_symlink():
+            print(
+                f"Ignoring symbolic-link radio state file {self.state_file}",
+                flush=True,
+            )
+            return
+        try:
+            if self.state_file.stat().st_size > 64 * 1024:
+                raise ValueError("radio state file is too large")
+            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") != RADIO_STATE_VERSION
+                or not isinstance(payload.get("radios"), dict)
+            ):
+                raise ValueError("unsupported radio state format")
+            for name, radio in payload["radios"].items():
+                if isinstance(name, str) and isinstance(radio, dict):
+                    self.persistent_configs[name] = dict(radio)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Could not load persistent radio state: {exc}", flush=True)
+
+    def _write_persistent_configs_locked(self) -> None:
+        """Atomically save desired auxiliary radios in the data volume."""
+        self.data_directory.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_file.with_name(f".{self.state_file.name}.tmp")
+        payload = {
+            "version": RADIO_STATE_VERSION,
+            "radios": {
+                name: self.persistent_configs[name]
+                for name in sorted(self.persistent_configs)
+            },
+        }
+        try:
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary.chmod(0o600)
+            temporary.replace(self.state_file)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"could not persist auxiliary radio configuration: {exc}"
+            ) from exc
+
     def _consume_output(
         self,
         name: str,
         process: subprocess.Popen[str],
         path: Path,
         publish_meter_ids: frozenset[str],
+        publish_all: bool,
     ) -> None:
-        """Tee auxiliary JSON to disk and publish selected meter events."""
+        """Tee auxiliary JSON to disk and optionally publish meter events."""
         assert process.stdout is not None
         try:
             with path.open("a", encoding="utf-8") as output:
                 for line in process.stdout:
                     output.write(line)
                     output.flush()
-                    if not publish_meter_ids or self.store is None:
+                    if (
+                        self.store is None
+                        or not publish_all and not publish_meter_ids
+                    ):
                         continue
                     try:
                         event = json.loads(line)
                         if not isinstance(event, dict):
                             continue
-                        self.store.record_selected(
-                            event,
-                            publish_meter_ids,
-                        )
+                        if publish_all:
+                            self.store.record_unfiltered(event)
+                        else:
+                            self.store.record_selected(
+                                event,
+                                publish_meter_ids,
+                            )
                     except json.JSONDecodeError:
                         continue
                     except OSError as exc:
@@ -1069,6 +1181,9 @@ class RadioManager:
         gain: Any = None,
         filename: Any = None,
         publish_meter_ids: Any = None,
+        publish_all: Any = False,
+        persistent: Any = True,
+        _restoring: bool = False,
     ) -> dict[str, Any]:
         """Start or retune a named auxiliary receiver."""
         self._validate_name(name)
@@ -1087,6 +1202,20 @@ class RadioManager:
         safe_publish_meter_ids = self._validate_publish_meter_ids(
             publish_meter_ids
         )
+        safe_publish_all = self._validate_boolean(
+            publish_all,
+            "publish_all",
+            default=False,
+        )
+        safe_persistent = self._validate_boolean(
+            persistent,
+            "persistent",
+            default=True,
+        )
+        if safe_publish_all and safe_publish_meter_ids:
+            raise ValueError(
+                "publish_all and publish_meter_ids cannot be used together"
+            )
         path = self._capture_path(filename, safe_frequency)
         command = [
             self.config.rtl433_bin,
@@ -1123,6 +1252,7 @@ class RadioManager:
                         f"serial is already managed by radio {capture_name!r}"
                     )
             previous = self.captures.get(name)
+            previous_persistent = self.persistent_configs.get(name)
             old_frequencies = (
                 [float(value) for value in previous.frequencies_mhz]
                 if previous is not None
@@ -1145,7 +1275,13 @@ class RadioManager:
 
             output_thread = threading.Thread(
                 target=self._consume_output,
-                args=(name, process, path, safe_publish_meter_ids),
+                args=(
+                    name,
+                    process,
+                    path,
+                    safe_publish_meter_ids,
+                    safe_publish_all,
+                ),
                 name=f"rtl433-{name}",
                 daemon=True,
             )
@@ -1167,13 +1303,30 @@ class RadioManager:
                 serial=safe_serial,
                 frequencies_mhz=safe_frequencies,
                 hop_seconds=safe_hop_seconds,
+                gain=safe_gain,
                 filename=path.name,
                 started_at=utc_now(),
                 process=process,
                 output_thread=output_thread,
                 publish_meter_ids=safe_publish_meter_ids,
+                publish_all=safe_publish_all,
+                persistent=safe_persistent,
             )
             self.captures[name] = capture
+            if safe_persistent:
+                self.persistent_configs[name] = capture.persistent_config()
+            else:
+                self.persistent_configs.pop(name, None)
+            if not _restoring:
+                try:
+                    self._write_persistent_configs_locked()
+                except RuntimeError:
+                    self._stop_locked(name)
+                    if previous_persistent is None:
+                        self.persistent_configs.pop(name, None)
+                    else:
+                        self.persistent_configs[name] = previous_persistent
+                    raise
             print(
                 "radio_adjustment "
                 + json.dumps(
@@ -1185,8 +1338,26 @@ class RadioManager:
                             float(value) for value in safe_frequencies
                         ],
                         "hop_seconds": safe_hop_seconds,
-                        "published_meter_count": len(safe_publish_meter_ids),
-                        "reason": "authenticated radio-control API",
+                        "publish_mode": (
+                            "all"
+                            if safe_publish_all
+                            else (
+                                "allowlist"
+                                if safe_publish_meter_ids
+                                else "none"
+                            )
+                        ),
+                        "published_meter_count": (
+                            None
+                            if safe_publish_all
+                            else len(safe_publish_meter_ids)
+                        ),
+                        "persistent": safe_persistent,
+                        "reason": (
+                            "persistent startup restore"
+                            if _restoring
+                            else "authenticated radio-control API"
+                        ),
                     },
                     sort_keys=True,
                 ),
@@ -1197,7 +1368,30 @@ class RadioManager:
     def stop(self, name: str) -> bool:
         self._validate_name(name)
         with self.lock:
-            return self._stop_locked(name)
+            stopped = self._stop_locked(name)
+            forgotten = self.persistent_configs.pop(name, None) is not None
+            if forgotten:
+                self._write_persistent_configs_locked()
+            return stopped or forgotten
+
+    def restore_persistent(self) -> None:
+        """Restore saved auxiliary radios after the production receiver starts."""
+        if not self.enabled or not self.persistent_configs:
+            return
+        restored = 0
+        for name, radio in list(self.persistent_configs.items()):
+            try:
+                self.start(name, _restoring=True, **radio)
+                restored += 1
+            except (RuntimeError, ValueError) as exc:
+                print(
+                    f"Could not restore persistent radio {name}: {exc}",
+                    flush=True,
+                )
+        print(
+            f"Restored {restored} persistent auxiliary radio(s)",
+            flush=True,
+        )
 
     def statuses(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -1466,6 +1660,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 gain=payload.get("gain"),
                 filename=payload.get("filename"),
                 publish_meter_ids=payload.get("publish_meter_ids"),
+                publish_all=payload.get("publish_all"),
+                persistent=payload.get("persistent"),
             )
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
@@ -1519,6 +1715,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     server.timeout = 0.5
     receiver.start()
+    radio_manager.restore_persistent()
     print(f"HTTP server listening on {config.http_host}:{config.http_port}", flush=True)
     try:
         while not stopping.is_set():
