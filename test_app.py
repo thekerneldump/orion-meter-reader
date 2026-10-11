@@ -629,7 +629,7 @@ class RadioManagerTests(unittest.TestCase):
 
     def test_target_tracking_recenters_only_on_selected_meter(self):
         tracking = ManagedTracking(
-            meter_id="22222222",
+            meter_ids=frozenset({"22222222"}),
             auto_recenter=True,
             auto_seek=True,
             recenter_threshold_mhz=0.35,
@@ -669,7 +669,7 @@ class RadioManagerTests(unittest.TestCase):
 
     def test_target_tracking_seeks_after_silence(self):
         tracking = ManagedTracking(
-            meter_id="22222222",
+            meter_ids=frozenset({"22222222"}),
             auto_recenter=False,
             auto_seek=True,
             recenter_threshold_mhz=0.35,
@@ -684,6 +684,32 @@ class RadioManagerTests(unittest.TestCase):
         adjustment = tracking.next_adjustment(916.0, now=180)
         self.assertEqual(adjustment["action"], "seek")
         self.assertEqual(adjustment["new_frequency_mhz"], 922.0)
+
+    def test_multi_target_tracking_scans_even_while_one_target_is_active(self):
+        tracking = ManagedTracking(
+            meter_ids=frozenset({"22222222", "33333333"}),
+            auto_recenter=True,
+            auto_seek=True,
+            recenter_threshold_mhz=0.35,
+            recenter_min_packets=3,
+            recenter_window_seconds=300,
+            recenter_cooldown_seconds=900,
+            seek_silence_seconds=180,
+            seek_frequencies_mhz=(910.0, 916.0, 922.0),
+            scan_interval_seconds=300,
+            last_target_packet_monotonic=299,
+            last_scan_monotonic=0,
+        )
+        tracking.observe(
+            {"id": 22222222, "freq1": 915.9, "freq2": 916.1},
+            916.0,
+            now=299,
+        )
+        adjustment = tracking.next_adjustment(916.0, now=300)
+        self.assertEqual(adjustment["action"], "seek")
+        self.assertEqual(adjustment["new_frequency_mhz"], 922.0)
+        self.assertIn("scheduled multi-target scan", adjustment["reason"])
+        self.assertEqual(tracking.seen_meter_ids, {"22222222"})
 
     def test_tracking_configuration_is_persistent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -718,6 +744,45 @@ class RadioManagerTests(unittest.TestCase):
             )["radios"]["tracker"]
             self.assertEqual(saved["tracking_meter_id"], "22222222")
             self.assertEqual(saved["seek_frequencies_mhz"], [910.0, 916.0, 922.0])
+            manager.stop_all()
+
+    def test_multi_target_tracking_configuration_is_persistent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            config = Config(
+                sdr_serial="ORION",
+                data_file=path,
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config, ReadingStore(config))
+            process = FakeProcess()
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=process,
+            ):
+                status = manager.start(
+                    "tracker",
+                    serial="AUX1",
+                    frequency_mhz=919.2,
+                    filename="tracking.jsonl",
+                    tracking_meter_ids=["22222222", "33333333"],
+                    scan_interval_seconds=300,
+                    seek_frequencies_mhz=[910.0, 916.0, 922.0],
+                )
+
+            self.assertEqual(status["tracked_meter_count"], 2)
+            self.assertEqual(status["scan_interval_seconds"], 300)
+            saved = json.loads(
+                path.with_name("managed-radios.json").read_text()
+            )["radios"]["tracker"]
+            self.assertEqual(
+                saved["tracking_meter_ids"],
+                ["22222222", "33333333"],
+            )
+            self.assertNotIn("tracking_meter_id", saved)
+            self.assertEqual(saved["scan_interval_seconds"], 300)
             manager.stop_all()
 
     def test_tracking_adjustment_restarts_only_the_managed_radio(self):
@@ -798,6 +863,32 @@ class RadioManagerTests(unittest.TestCase):
                     frequencies_mhz=[916.0, 922.0],
                     hop_seconds=60,
                     tracking_meter_id="22222222",
+                )
+
+    def test_tracking_rejects_conflicting_targets_and_short_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            with self.assertRaisesRegex(ValueError, "not both"):
+                manager.start(
+                    "tracker",
+                    serial="AUX1",
+                    frequency_mhz=916.0,
+                    tracking_meter_id="22222222",
+                    tracking_meter_ids=["33333333"],
+                )
+            with self.assertRaisesRegex(ValueError, "zero or at least 30"):
+                manager.start(
+                    "tracker",
+                    serial="AUX1",
+                    frequency_mhz=916.0,
+                    tracking_meter_ids=["22222222", "33333333"],
+                    scan_interval_seconds=10,
                 )
 
 

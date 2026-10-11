@@ -878,7 +878,7 @@ class Receiver:
 class ManagedTracking:
     """Target-aware tuning state for one managed auxiliary radio."""
 
-    meter_id: str
+    meter_ids: frozenset[str]
     auto_recenter: bool
     auto_seek: bool
     recenter_threshold_mhz: float
@@ -887,12 +887,17 @@ class ManagedTracking:
     recenter_cooldown_seconds: int
     seek_silence_seconds: int
     seek_frequencies_mhz: tuple[float, ...]
+    scan_interval_seconds: int = 0
     last_target_packet_monotonic: float = field(default_factory=time.monotonic)
+    last_scan_monotonic: float = field(default_factory=time.monotonic)
     last_target_packet_at: str | None = None
     last_recenter_monotonic: float | None = None
     last_recenter_at: str | None = None
     last_seek_at: str | None = None
-    observations: deque[tuple[float, float]] = field(default_factory=deque)
+    observations: dict[str, deque[tuple[float, float]]] = field(
+        default_factory=dict
+    )
+    seen_meter_ids: set[str] = field(default_factory=set)
     pending_adjustment: dict[str, Any] | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -904,12 +909,14 @@ class ManagedTracking:
         now: float | None = None,
     ) -> None:
         """Record a target packet and queue a recenter when it is warranted."""
-        if meter_id(event) != self.meter_id:
+        event_meter_id = meter_id(event)
+        if event_meter_id not in self.meter_ids:
             return
         observed_at = time.monotonic() if now is None else now
         with self.lock:
             self.last_target_packet_monotonic = observed_at
             self.last_target_packet_at = utc_now()
+            self.seen_meter_ids.add(event_meter_id)
             if not self.auto_recenter:
                 return
 
@@ -926,11 +933,15 @@ class ManagedTracking:
             if not MIN_CONTROL_FREQUENCY_MHZ <= midpoint <= MAX_CONTROL_FREQUENCY_MHZ:
                 return
 
-            self.observations.append((observed_at, midpoint))
+            observations = self.observations.setdefault(
+                event_meter_id,
+                deque(),
+            )
+            observations.append((observed_at, midpoint))
             cutoff = observed_at - self.recenter_window_seconds
-            while self.observations and self.observations[0][0] < cutoff:
-                self.observations.popleft()
-            if len(self.observations) < self.recenter_min_packets:
+            while observations and observations[0][0] < cutoff:
+                observations.popleft()
+            if len(observations) < self.recenter_min_packets:
                 return
             if (
                 self.last_recenter_monotonic is not None
@@ -940,7 +951,7 @@ class ManagedTracking:
                 return
 
             observed_midpoint = statistics.median(
-                value for _, value in self.observations
+                value for _, value in observations
             )
             if (
                 abs(observed_midpoint - current_frequency_mhz)
@@ -948,12 +959,17 @@ class ManagedTracking:
             ):
                 return
             new_frequency = round(observed_midpoint, 1)
-            if not MIN_CONTROL_FREQUENCY_MHZ <= new_frequency <= MAX_CONTROL_FREQUENCY_MHZ:
+            if not (
+                MIN_CONTROL_FREQUENCY_MHZ
+                <= new_frequency
+                <= MAX_CONTROL_FREQUENCY_MHZ
+            ):
                 return
 
-            packet_count = len(self.observations)
+            packet_count = len(observations)
             self.observations.clear()
             self.last_recenter_monotonic = observed_at
+            self.last_scan_monotonic = observed_at
             self.last_recenter_at = utc_now()
             self.pending_adjustment = {
                 "action": "recenter",
@@ -981,31 +997,59 @@ class ManagedTracking:
                 return adjustment
             if not self.auto_seek:
                 return None
+            if (
+                self.scan_interval_seconds
+                and observed_at - self.last_scan_monotonic
+                >= self.scan_interval_seconds
+            ):
+                return self._next_seek_adjustment(
+                    current_frequency_mhz,
+                    observed_at,
+                    reason=(
+                        "scheduled multi-target scan after "
+                        f"{self.scan_interval_seconds} seconds"
+                    ),
+                )
             silence_seconds = observed_at - self.last_target_packet_monotonic
             if silence_seconds < self.seek_silence_seconds:
                 return None
 
-            nearest_index = min(
-                range(len(self.seek_frequencies_mhz)),
-                key=lambda index: abs(
-                    self.seek_frequencies_mhz[index] - current_frequency_mhz
-                ),
-            )
-            next_frequency = self.seek_frequencies_mhz[
-                (nearest_index + 1) % len(self.seek_frequencies_mhz)
-            ]
-            self.last_target_packet_monotonic = observed_at
-            self.last_recenter_monotonic = None
-            self.last_seek_at = utc_now()
-            self.observations.clear()
-            return {
-                "action": "seek",
-                "old_frequency_mhz": current_frequency_mhz,
-                "new_frequency_mhz": next_frequency,
-                "reason": (
+            return self._next_seek_adjustment(
+                current_frequency_mhz,
+                observed_at,
+                reason=(
                     f"no target packets for {self.seek_silence_seconds} seconds"
                 ),
-            }
+            )
+
+    def _next_seek_adjustment(
+        self,
+        current_frequency_mhz: float,
+        observed_at: float,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Advance to the next configured center and reset dwell timers."""
+        nearest_index = min(
+            range(len(self.seek_frequencies_mhz)),
+            key=lambda index: abs(
+                self.seek_frequencies_mhz[index] - current_frequency_mhz
+            ),
+        )
+        next_frequency = self.seek_frequencies_mhz[
+            (nearest_index + 1) % len(self.seek_frequencies_mhz)
+        ]
+        self.last_target_packet_monotonic = observed_at
+        self.last_scan_monotonic = observed_at
+        self.last_recenter_monotonic = None
+        self.last_seek_at = utc_now()
+        self.observations.clear()
+        return {
+            "action": "seek",
+            "old_frequency_mhz": current_frequency_mhz,
+            "new_frequency_mhz": next_frequency,
+            "reason": reason,
+        }
 
 
 @dataclass
@@ -1044,27 +1088,36 @@ class ManagedCapture:
                 float(value) for value in self.frequencies_mhz
             ]
         if self.tracking is not None:
-            config.update(
-                {
-                    "tracking_meter_id": self.tracking.meter_id,
-                    "auto_recenter": self.tracking.auto_recenter,
-                    "auto_seek": self.tracking.auto_seek,
-                    "recenter_threshold_mhz": (
-                        self.tracking.recenter_threshold_mhz
-                    ),
-                    "recenter_min_packets": self.tracking.recenter_min_packets,
-                    "recenter_window_seconds": (
-                        self.tracking.recenter_window_seconds
-                    ),
-                    "recenter_cooldown_seconds": (
-                        self.tracking.recenter_cooldown_seconds
-                    ),
-                    "seek_silence_seconds": self.tracking.seek_silence_seconds,
-                    "seek_frequencies_mhz": list(
-                        self.tracking.seek_frequencies_mhz
-                    ),
-                }
-            )
+            tracking_config: dict[str, Any] = {
+                "auto_recenter": self.tracking.auto_recenter,
+                "auto_seek": self.tracking.auto_seek,
+                "recenter_threshold_mhz": (
+                    self.tracking.recenter_threshold_mhz
+                ),
+                "recenter_min_packets": self.tracking.recenter_min_packets,
+                "recenter_window_seconds": (
+                    self.tracking.recenter_window_seconds
+                ),
+                "recenter_cooldown_seconds": (
+                    self.tracking.recenter_cooldown_seconds
+                ),
+                "seek_silence_seconds": self.tracking.seek_silence_seconds,
+                "seek_frequencies_mhz": list(
+                    self.tracking.seek_frequencies_mhz
+                ),
+                "scan_interval_seconds": (
+                    self.tracking.scan_interval_seconds
+                ),
+            }
+            if len(self.tracking.meter_ids) == 1:
+                tracking_config["tracking_meter_id"] = next(
+                    iter(self.tracking.meter_ids)
+                )
+            else:
+                tracking_config["tracking_meter_ids"] = sorted(
+                    self.tracking.meter_ids
+                )
+            config.update(tracking_config)
         return config
 
     def status(self) -> dict[str, Any]:
@@ -1102,6 +1155,13 @@ class ManagedCapture:
                         "auto_recenter_enabled": self.tracking.auto_recenter,
                         "auto_seek_enabled": self.tracking.auto_seek,
                         "seek_silence_seconds": self.tracking.seek_silence_seconds,
+                        "scan_interval_seconds": (
+                            self.tracking.scan_interval_seconds
+                        ),
+                        "tracked_meter_count": len(self.tracking.meter_ids),
+                        "seen_target_count": len(
+                            self.tracking.seen_meter_ids
+                        ),
                         "last_target_packet_at": self.tracking.last_target_packet_at,
                         "last_recenter_at": self.tracking.last_recenter_at,
                         "last_seek_at": self.tracking.last_seek_at,
@@ -1244,15 +1304,42 @@ class RadioManager:
             raise ValueError(f"{name} must be true or false")
         return value
 
-    def _validate_tracking_meter_id(self, value: Any) -> str | None:
-        if value is None:
-            return None
+    def _validate_tracking_meter_id(self, value: Any) -> str:
         if isinstance(value, bool) or not isinstance(value, (int, str)):
             raise ValueError("tracking_meter_id must be a numeric meter ID")
         value = str(value).strip()
         if not value.isdigit() or len(value) > 32:
             raise ValueError("tracking_meter_id must be a numeric meter ID")
         return value
+
+    def _validate_tracking_meter_ids(
+        self,
+        tracking_meter_id: Any,
+        tracking_meter_ids: Any,
+    ) -> frozenset[str]:
+        if tracking_meter_id is not None and tracking_meter_ids is not None:
+            raise ValueError(
+                "provide tracking_meter_id or tracking_meter_ids, not both"
+            )
+        if tracking_meter_ids is None:
+            if tracking_meter_id is None:
+                return frozenset()
+            return frozenset(
+                {self._validate_tracking_meter_id(tracking_meter_id)}
+            )
+        if not isinstance(tracking_meter_ids, list):
+            raise ValueError("tracking_meter_ids must be a JSON array")
+        if not 1 <= len(tracking_meter_ids) <= 32:
+            raise ValueError(
+                "tracking_meter_ids must contain 1 through 32 values"
+            )
+        normalized = [
+            self._validate_tracking_meter_id(value)
+            for value in tracking_meter_ids
+        ]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("tracking_meter_ids cannot contain duplicates")
+        return frozenset(normalized)
 
     def _validate_tracking_number(
         self,
@@ -1312,6 +1399,7 @@ class RadioManager:
         self,
         *,
         tracking_meter_id: Any,
+        tracking_meter_ids: Any,
         auto_recenter: Any,
         auto_seek: Any,
         recenter_threshold_mhz: Any,
@@ -1320,23 +1408,28 @@ class RadioManager:
         recenter_cooldown_seconds: Any,
         seek_silence_seconds: Any,
         seek_frequencies_mhz: Any,
+        scan_interval_seconds: Any,
         sweeping: bool,
     ) -> ManagedTracking | None:
-        target = self._validate_tracking_meter_id(tracking_meter_id)
+        targets = self._validate_tracking_meter_ids(
+            tracking_meter_id,
+            tracking_meter_ids,
+        )
         recenter = self._validate_boolean(
             auto_recenter,
             "auto_recenter",
-            default=target is not None,
+            default=bool(targets),
         )
         seek = self._validate_boolean(
             auto_seek,
             "auto_seek",
-            default=target is not None,
+            default=bool(targets),
         )
-        if target is None:
+        if not targets:
             if recenter or seek:
                 raise ValueError(
-                    "tracking_meter_id is required for automatic recentering or seeking"
+                    "a tracking meter ID is required for automatic "
+                    "recentering or seeking"
                 )
             return None
         if sweeping:
@@ -1347,8 +1440,26 @@ class RadioManager:
             raise ValueError(
                 "tracking requires auto_recenter or auto_seek to be enabled"
             )
+        scan_interval = self._validate_tracking_integer(
+            scan_interval_seconds,
+            "scan_interval_seconds",
+            0,
+            minimum=0,
+        )
+        if scan_interval and scan_interval < 30:
+            raise ValueError(
+                "scan_interval_seconds must be zero or at least 30"
+            )
+        if scan_interval and len(targets) < 2:
+            raise ValueError(
+                "scan_interval_seconds requires multiple tracking_meter_ids"
+            )
+        if scan_interval and not seek:
+            raise ValueError(
+                "scan_interval_seconds requires auto_seek to be enabled"
+            )
         return ManagedTracking(
-            meter_id=target,
+            meter_ids=targets,
             auto_recenter=recenter,
             auto_seek=seek,
             recenter_threshold_mhz=self._validate_tracking_number(
@@ -1384,6 +1495,7 @@ class RadioManager:
             seek_frequencies_mhz=self._validate_seek_frequencies(
                 seek_frequencies_mhz
             ),
+            scan_interval_seconds=scan_interval,
         )
 
     def _load_persistent_configs(self) -> None:
@@ -1656,6 +1768,7 @@ class RadioManager:
         publish_all: Any = False,
         persistent: Any = True,
         tracking_meter_id: Any = None,
+        tracking_meter_ids: Any = None,
         auto_recenter: Any = None,
         auto_seek: Any = None,
         recenter_threshold_mhz: Any = None,
@@ -1664,6 +1777,7 @@ class RadioManager:
         recenter_cooldown_seconds: Any = None,
         seek_silence_seconds: Any = None,
         seek_frequencies_mhz: Any = None,
+        scan_interval_seconds: Any = None,
         _restoring: bool = False,
     ) -> dict[str, Any]:
         """Start or retune a named auxiliary receiver."""
@@ -1695,6 +1809,7 @@ class RadioManager:
         )
         safe_tracking = self._tracking_config(
             tracking_meter_id=tracking_meter_id,
+            tracking_meter_ids=tracking_meter_ids,
             auto_recenter=auto_recenter,
             auto_seek=auto_seek,
             recenter_threshold_mhz=recenter_threshold_mhz,
@@ -1703,6 +1818,7 @@ class RadioManager:
             recenter_cooldown_seconds=recenter_cooldown_seconds,
             seek_silence_seconds=seek_silence_seconds,
             seek_frequencies_mhz=seek_frequencies_mhz,
+            scan_interval_seconds=scan_interval_seconds,
             sweeping=len(safe_frequencies) > 1,
         )
         if safe_publish_all and safe_publish_meter_ids:
@@ -2165,6 +2281,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 publish_all=payload.get("publish_all"),
                 persistent=payload.get("persistent"),
                 tracking_meter_id=payload.get("tracking_meter_id"),
+                tracking_meter_ids=payload.get("tracking_meter_ids"),
                 auto_recenter=payload.get("auto_recenter"),
                 auto_seek=payload.get("auto_seek"),
                 recenter_threshold_mhz=payload.get(
@@ -2179,6 +2296,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 ),
                 seek_silence_seconds=payload.get("seek_silence_seconds"),
                 seek_frequencies_mhz=payload.get("seek_frequencies_mhz"),
+                scan_interval_seconds=payload.get("scan_interval_seconds"),
             )
         except ValueError as exc:
             self._json(400, {"error": str(exc)})

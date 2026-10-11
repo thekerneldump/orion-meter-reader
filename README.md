@@ -288,11 +288,12 @@ with the previous center, new center, and adjustment reason.
 
 ### Target-aware auxiliary tuning
 
-A fixed-frequency auxiliary radio can follow one selected meter automatically.
-Set `tracking_meter_id` and the service will use that meter's decoded `freq1`
-and `freq2` midpoint to recenter the radio after five consistent packets. If the
+A fixed-frequency auxiliary radio can follow one or more selected meters
+automatically. Set `tracking_meter_id` for one target, or `tracking_meter_ids`
+for several. The service uses each target's decoded `freq1` and `freq2` midpoint
+to recenter the radio after five consistent packets from that meter. If every
 target is silent for three minutes, the same radio advances through the seek
-list until it finds the target again:
+list until it finds one again:
 
 ```json
 {
@@ -307,9 +308,9 @@ list until it finds the target again:
 }
 ```
 
-Providing `tracking_meter_id` enables both automatic recentering and silence
-seeking by default. Set `auto_recenter` or `auto_seek` to `false` to disable one
-behavior. The optional tuning properties are:
+Providing either tracking property enables both automatic recentering and
+silence seeking by default. Set `auto_recenter` or `auto_seek` to `false` to
+disable one behavior. The optional tuning properties are:
 
 - `recenter_threshold_mhz` (default `0.35`)
 - `recenter_min_packets` (default `5`, minimum `3`)
@@ -317,12 +318,33 @@ behavior. The optional tuning properties are:
 - `recenter_cooldown_seconds` (default `900`)
 - `seek_silence_seconds` (default `180`, minimum `15`)
 - `seek_frequencies_mhz` (2 through 32 unique centers)
+- `scan_interval_seconds` (default `0`; `0` disables scheduled scanning)
+
+When sharing one SDR among several targets, set `tracking_meter_ids` and a
+`scan_interval_seconds` of at least 30. The radio then advances to the next seek
+center at that interval even if one strong target remains audible. This prevents
+one meter from holding the radio on a single center while the other targets are
+using different channels:
+
+```json
+{
+  "serial": "AUX1",
+  "frequency_mhz": 919.2,
+  "tracking_meter_ids": [12345678, 23456789],
+  "scan_interval_seconds": 300,
+  "seek_silence_seconds": 60,
+  "seek_frequencies_mhz": [904.8, 906.4, 908.0, 909.6, 911.2, 912.8, 914.4, 916.0, 917.6, 919.2, 920.8, 922.4, 924.0],
+  "publish_meter_ids": [12345678, 23456789],
+  "persistent": true
+}
+```
 
 Target tracking requires one fixed `frequency_mhz`; it cannot be combined with
 the multi-frequency `frequencies_mhz` sweep. Every automatic move is persisted
 and logged as `radio_adjustment`, with `action` set to `recenter` or `seek`.
 Authenticated `GET /api/radios` reports whether tracking is enabled and the last
-target packet, recenter, and seek times without returning the target meter ID.
+target packet, recenter, and seek times, plus tracked and seen target counts,
+without returning target meter IDs.
 
 An auxiliary receiver can instead sweep several centers in one persistent
 `rtl_433` process. Supply `frequencies_mhz` instead of `frequency_mhz`, plus a
