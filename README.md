@@ -286,6 +286,44 @@ through the API stops it and removes its saved configuration.
 Each start or retune also writes a `radio_adjustment` entry to the container log
 with the previous center, new center, and adjustment reason.
 
+### Target-aware auxiliary tuning
+
+A fixed-frequency auxiliary radio can follow one selected meter automatically.
+Set `tracking_meter_id` and the service will use that meter's decoded `freq1`
+and `freq2` midpoint to recenter the radio after five consistent packets. If the
+target is silent for three minutes, the same radio advances through the seek
+list until it finds the target again:
+
+```json
+{
+  "serial": "AUX1",
+  "frequency_mhz": 919.2,
+  "gain": 49.6,
+  "filename": "tracked-meter.jsonl",
+  "tracking_meter_id": 12345678,
+  "seek_frequencies_mhz": [904.8, 906.4, 908.0, 909.6, 911.2, 912.8, 914.4, 916.0, 917.6, 919.2, 920.8, 922.4, 924.0],
+  "publish_meter_ids": [12345678],
+  "persistent": true
+}
+```
+
+Providing `tracking_meter_id` enables both automatic recentering and silence
+seeking by default. Set `auto_recenter` or `auto_seek` to `false` to disable one
+behavior. The optional tuning properties are:
+
+- `recenter_threshold_mhz` (default `0.35`)
+- `recenter_min_packets` (default `5`, minimum `3`)
+- `recenter_window_seconds` (default `300`)
+- `recenter_cooldown_seconds` (default `900`)
+- `seek_silence_seconds` (default `180`, minimum `15`)
+- `seek_frequencies_mhz` (2 through 32 unique centers)
+
+Target tracking requires one fixed `frequency_mhz`; it cannot be combined with
+the multi-frequency `frequencies_mhz` sweep. Every automatic move is persisted
+and logged as `radio_adjustment`, with `action` set to `recenter` or `seek`.
+Authenticated `GET /api/radios` reports whether tracking is enabled and the last
+target packet, recenter, and seek times without returning the target meter ID.
+
 An auxiliary receiver can instead sweep several centers in one persistent
 `rtl_433` process. Supply `frequencies_mhz` instead of `frequency_mhz`, plus a
 hop interval from 5 through 3600 seconds:
@@ -313,9 +351,8 @@ GET /api/radios
 DELETE /api/radios/demo
 ```
 
-Managed capture files immediately appear in `GET /files`. Auxiliary captures
-stop when the main service container stops and are not automatically restarted
-after a container restart.
+Managed capture files immediately appear in `GET /files`. Persistent auxiliary
+captures are automatically restored after a container restart.
 
 ## Troubleshooting
 

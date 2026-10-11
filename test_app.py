@@ -23,6 +23,7 @@ Config = orion_meter_reader.Config
 ReadingStore = orion_meter_reader.ReadingStore
 Receiver = orion_meter_reader.Receiver
 RadioManager = orion_meter_reader.RadioManager
+ManagedTracking = orion_meter_reader.ManagedTracking
 AppServer = orion_meter_reader.AppServer
 decorate_event = orion_meter_reader.decorate_event
 canonical_frequency_mhz = orion_meter_reader.canonical_frequency_mhz
@@ -624,6 +625,179 @@ class RadioManagerTests(unittest.TestCase):
                     serial="AUX1",
                     frequency_mhz=916.4,
                     publish_all="true",
+                )
+
+    def test_target_tracking_recenters_only_on_selected_meter(self):
+        tracking = ManagedTracking(
+            meter_id="22222222",
+            auto_recenter=True,
+            auto_seek=True,
+            recenter_threshold_mhz=0.35,
+            recenter_min_packets=3,
+            recenter_window_seconds=300,
+            recenter_cooldown_seconds=900,
+            seek_silence_seconds=180,
+            seek_frequencies_mhz=(910.0, 916.0, 922.0),
+            last_target_packet_monotonic=0,
+        )
+        for now in (1, 2, 3):
+            tracking.observe(
+                {
+                    "id": 33333333,
+                    "freq1": 919.0,
+                    "freq2": 919.2,
+                },
+                916.0,
+                now=now,
+            )
+        self.assertIsNone(tracking.next_adjustment(916.0, now=3))
+
+        for now in (4, 5, 6):
+            tracking.observe(
+                {
+                    "id": 22222222,
+                    "freq1": 919.0,
+                    "freq2": 919.2,
+                },
+                916.0,
+                now=now,
+            )
+        adjustment = tracking.next_adjustment(916.0, now=6)
+        self.assertEqual(adjustment["action"], "recenter")
+        self.assertEqual(adjustment["new_frequency_mhz"], 919.1)
+        self.assertEqual(adjustment["packet_count"], 3)
+
+    def test_target_tracking_seeks_after_silence(self):
+        tracking = ManagedTracking(
+            meter_id="22222222",
+            auto_recenter=False,
+            auto_seek=True,
+            recenter_threshold_mhz=0.35,
+            recenter_min_packets=5,
+            recenter_window_seconds=300,
+            recenter_cooldown_seconds=900,
+            seek_silence_seconds=180,
+            seek_frequencies_mhz=(910.0, 916.0, 922.0),
+            last_target_packet_monotonic=0,
+        )
+        self.assertIsNone(tracking.next_adjustment(916.0, now=179))
+        adjustment = tracking.next_adjustment(916.0, now=180)
+        self.assertEqual(adjustment["action"], "seek")
+        self.assertEqual(adjustment["new_frequency_mhz"], 922.0)
+
+    def test_tracking_configuration_is_persistent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            config = Config(
+                sdr_serial="ORION",
+                data_file=path,
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config, ReadingStore(config))
+            process = FakeProcess()
+            with mock.patch.object(
+                orion_meter_reader.subprocess,
+                "Popen",
+                return_value=process,
+            ):
+                status = manager.start(
+                    "tracker",
+                    serial="AUX1",
+                    frequency_mhz=919.2,
+                    filename="tracking.jsonl",
+                    tracking_meter_id="22222222",
+                    seek_frequencies_mhz=[910.0, 916.0, 922.0],
+                )
+
+            self.assertTrue(status["tracking_enabled"])
+            self.assertTrue(status["auto_recenter_enabled"])
+            self.assertTrue(status["auto_seek_enabled"])
+            saved = json.loads(
+                path.with_name("managed-radios.json").read_text()
+            )["radios"]["tracker"]
+            self.assertEqual(saved["tracking_meter_id"], "22222222")
+            self.assertEqual(saved["seek_frequencies_mhz"], [910.0, 916.0, 922.0])
+            manager.stop_all()
+
+    def test_tracking_adjustment_restarts_only_the_managed_radio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "readings.jsonl"
+            config = Config(
+                sdr_serial="ORION",
+                data_file=path,
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config, ReadingStore(config))
+            first_process = FakeProcess()
+            replacement_process = FakeProcess()
+            with (
+                mock.patch.object(
+                    manager,
+                    "_ensure_tracking_thread_locked",
+                ),
+                mock.patch.object(
+                    orion_meter_reader.subprocess,
+                    "Popen",
+                    side_effect=[first_process, replacement_process],
+                ) as popen,
+            ):
+                manager.start(
+                    "tracker",
+                    serial="AUX1",
+                    frequency_mhz=916.0,
+                    filename="tracking.jsonl",
+                    tracking_meter_id="22222222",
+                    recenter_min_packets=3,
+                    seek_frequencies_mhz=[910.0, 916.0, 922.0],
+                )
+                tracking = manager.captures["tracker"].tracking
+                self.assertIsNotNone(tracking)
+                for now in (1, 2, 3):
+                    tracking.observe(
+                        {
+                            "id": 22222222,
+                            "freq1": 919.0,
+                            "freq2": 919.2,
+                        },
+                        916.0,
+                        now=now,
+                    )
+                self.assertEqual(manager.adjust_tracking_radios(now=3), 1)
+
+            self.assertTrue(first_process.terminated)
+            self.assertEqual(
+                manager.captures["tracker"].status()["frequency_mhz"],
+                919.1,
+            )
+            replacement_command = popen.call_args_list[1].args[0]
+            self.assertEqual(
+                replacement_command[replacement_command.index("-f") + 1],
+                "919.1M",
+            )
+            saved = json.loads(
+                path.with_name("managed-radios.json").read_text()
+            )["radios"]["tracker"]
+            self.assertEqual(saved["frequency_mhz"], 919.1)
+            manager.stop_all()
+
+    def test_tracking_rejects_frequency_sweeps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                sdr_serial="ORION",
+                data_file=Path(directory) / "readings.jsonl",
+                radio_control_token="test-token",
+                radio_control_serials=frozenset({"AUX1"}),
+            )
+            manager = RadioManager(config)
+            with self.assertRaisesRegex(ValueError, "requires one frequency"):
+                manager.start(
+                    "tracker",
+                    serial="AUX1",
+                    frequencies_mhz=[916.0, 922.0],
+                    hop_seconds=60,
+                    tracking_meter_id="22222222",
                 )
 
 
